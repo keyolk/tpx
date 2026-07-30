@@ -62,6 +62,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Some(Modal::Confirm { title, command, .. }) => {
             render_confirm(frame, area, title, command, palette)
         }
+        Some(Modal::CommandMenu) => render_command_menu(frame, area, palette),
+        Some(Modal::SortMenu) => render_sort_menu(frame, area, app, palette),
         None => {}
     }
 }
@@ -874,4 +876,80 @@ mod metric_tests {
         assert!(tree.contains("13.6"), "tree row shows subtree cpu: {tree}");
         assert!(tree.contains("849"), "tree row shows subtree rss: {tree}");
     }
+}
+
+/// The `x` command menu — a compact popup listing two-keystroke commands.
+fn render_command_menu(frame: &mut Frame, area: Rect, palette: Palette) {
+    let entries = [
+        ("xd", "dump packets"),
+        ("xs", "stop capture"),
+        ("xk", "send SIGTERM"),
+        ("xo", "switch to pane"),
+        ("xc", "copy selection"),
+        ("xt", "sort…"),
+    ];
+    let height = entries.len() as u16 + 4;
+    let box_area = overlay(area, 40, height);
+    frame.render_widget(Clear, box_area);
+
+    let mut lines = vec![
+        Line::styled("  x commands", palette.bold(ACCENT)),
+        Line::default(),
+    ];
+    for (key, desc) in entries {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<4} "), palette.bold(INFO)),
+            Span::raw(desc),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled("  Esc to cancel", palette.dim()));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(palette.fg(ACCENT))
+        .title(Span::styled(" x ", palette.bold(ACCENT)));
+    frame.render_widget(Paragraph::new(lines).block(block), box_area);
+}
+
+/// The sort submenu — pick an ordering directly instead of cycling.
+fn render_sort_menu(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
+    use crate::tree::Sort;
+    let entries = [
+        ("1", Sort::Tree, "tmux order"),
+        ("2", Sort::Cpu, "heaviest cpu first"),
+        ("3", Sort::Memory, "largest rss first"),
+        ("4", Sort::Age, "newest first"),
+        ("5", Sort::Connections, "most connections first"),
+    ];
+    let height = entries.len() as u16 + 4;
+    let box_area = overlay(area, 45, height);
+    frame.render_widget(Clear, box_area);
+
+    let mut lines = vec![
+        Line::styled("  sort by", palette.bold(ACCENT)),
+        Line::default(),
+    ];
+    for (key, sort, desc) in entries {
+        let current = app.sort == sort;
+        let marker = if current { "● " } else { "  " };
+        let style = if current {
+            palette.bold(SUCCESS)
+        } else {
+            palette.fg(INFO)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{key} "), style),
+            Span::styled(format!("{:<12}", sort.label()), style),
+            Span::styled(desc, palette.dim()),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled("  Esc to cancel", palette.dim()));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(palette.fg(ACCENT))
+        .title(Span::styled(" sort ", palette.bold(ACCENT)));
+    frame.render_widget(Paragraph::new(lines).block(block), box_area);
 }

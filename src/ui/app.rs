@@ -63,6 +63,13 @@ impl Facet {
 /// A modal overlay. Only one can be open, and `Esc` always closes it.
 pub enum Modal {
     Help,
+    /// The `x` command menu — a two-keystroke prefix for extended actions.
+    /// Pressing `x` opens this; the next key selects and runs a command.
+    CommandMenu,
+    /// A sort submenu, reached from the command menu. The number keys select
+    /// a sort directly, which avoids the cycling that was slow to reach a
+    /// specific ordering.
+    SortMenu,
     /// Confirm a privileged or side-effecting action before running it. The
     /// exact command is shown so nothing runs invisibly.
     Confirm {

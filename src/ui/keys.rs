@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::collect::{self, capture};
 use crate::model::Origin;
-use crate::tree::{Kind, Noise, Scope};
+use crate::tree::{Kind, Noise, Scope, Sort};
 
 use super::app::{App, Facet, Modal, PendingAction};
 
@@ -77,6 +77,56 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Effect {
             let action = action.clone();
             app.modal = None;
             run_action(app, action)
+        }
+        // The command menu: `x` opened it, the next key picks a command.
+        (Some(Modal::CommandMenu), KeyCode::Char('d')) => {
+            app.modal = None;
+            start_capture(app)
+        }
+        (Some(Modal::CommandMenu), KeyCode::Char('s')) => {
+            app.modal = None;
+            app.stop_capture();
+            app.set_status("capture stopped");
+            Effect::None
+        }
+        (Some(Modal::CommandMenu), KeyCode::Char('k')) => {
+            app.modal = None;
+            request_signal(app, "TERM")
+        }
+        (Some(Modal::CommandMenu), KeyCode::Char('o')) => {
+            app.modal = None;
+            switch_to_pane(app)
+        }
+        (Some(Modal::CommandMenu), KeyCode::Char('c')) => {
+            app.modal = None;
+            copy_selection(app);
+            Effect::None
+        }
+        (Some(Modal::CommandMenu), KeyCode::Char('t')) => {
+            // Sort submenu — choose directly instead of cycling.
+            app.modal = Some(Modal::SortMenu);
+            app.touch();
+            Effect::None
+        }
+        // Sort menu: number keys select the ordering directly.
+        (Some(Modal::SortMenu), KeyCode::Char(ch @ '1'..='5')) => {
+            let sort = match ch {
+                '1' => Sort::Tree,
+                '2' => Sort::Cpu,
+                '3' => Sort::Memory,
+                '4' => Sort::Age,
+                '5' => Sort::Connections,
+                _ => unreachable!(),
+            };
+            app.modal = None;
+            app.sort = sort;
+            app.set_status(format!(
+                "sort: {}{}",
+                app.sort.label(),
+                if app.sort.is_flat() { " (flat)" } else { "" }
+            ));
+            app.rebuild();
+            Effect::None
         }
         _ => {
             app.touch();
@@ -186,7 +236,9 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
         KeyCode::Char('p') => app.jump_to_parent(),
         KeyCode::Char('P') => app.jump_to_peer(),
 
-        // Filter and noise.
+        // Filter, scope and noise stay as single keys — they are frequent and
+        // need to work fast. Sort moved to `xt` so it can be picked directly
+        // rather than cycled through.
         KeyCode::Char('/') => {
             app.filter_input = Some(app.filter.query.clone());
             app.touch();
@@ -198,8 +250,6 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
             }
         }
         KeyCode::Char('w') => {
-            // The default scope is the current window; `w` widens to the whole
-            // server and back, so a cross-window question does not need a restart.
             app.scope = match app.scope {
                 Scope::CurrentWindow => Scope::Server,
                 Scope::Server => Scope::CurrentWindow,
@@ -208,23 +258,8 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
                 Scope::CurrentWindow => "this window",
                 Scope::Server => "whole server",
             };
-            // Each scope has its own sensible default fold state (narrow opens
-            // everything, wide stays a map), so switching starts fresh rather
-            // than carrying folds that were meant for the other view.
             app.reset_expansion_for_scope();
             app.set_status(format!("scope: {label}"));
-            app.rebuild();
-        }
-        KeyCode::Char('s') => {
-            // Cycles tree -> cpu -> memory -> newest -> connections -> tree.
-            // Anything but `tree` flattens, because sorting inside the tree buries
-            // the top consumer under whichever session it happens to live in.
-            app.sort = app.sort.next();
-            app.set_status(format!(
-                "sort: {}{}",
-                app.sort.label(),
-                if app.sort.is_flat() { " (flat)" } else { "" }
-            ));
             app.rebuild();
         }
         KeyCode::Char('a') => {
@@ -241,7 +276,15 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
             app.rebuild();
         }
 
-        // Actions.
+        // `x` opens the command menu — a two-keystroke prefix for extended
+        // actions (dump, stop, kill, switch, copy, sort). Keeps the main keymap
+        // clean while leaving room for more commands without collisions.
+        KeyCode::Char('x') => {
+            app.modal = Some(Modal::CommandMenu);
+            app.touch();
+        }
+
+        // Actions that stay as single keys: frequent, or need to work fast.
         KeyCode::Char('r') => {
             app.collector.request();
             // A manual refresh is also the way to re-read a stale pane capture.
@@ -249,13 +292,6 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
             app.refresh_streams();
             app.set_status("refreshing…");
         }
-        KeyCode::Char('d') => return start_capture(app),
-        // `s` sorts, so stopping a capture moved here. `x` reads as "kill this"
-        // and collides with nothing.
-        KeyCode::Char('x') => app.stop_capture(),
-        KeyCode::Char('K') => return request_signal(app, "TERM"),
-        KeyCode::Char('o') => return switch_to_pane(app),
-        KeyCode::Char('y') => copy_selection(app),
 
         _ => {}
     }
@@ -503,11 +539,10 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("w", "widen scope: this window <-> whole server"),
     ("a", "toggle noise (show every process)"),
     ("r", "refresh"),
-    ("d", "dump packets for selection"),
-    ("x", "stop capture"),
-    ("o", "switch tmux to this pane"),
-    ("y", "copy pid / id / pane target"),
-    ("K", "send SIGTERM (confirms first)"),
+    (
+        "x…",
+        "extended commands: xd dump / xs stop / xk kill / xo switch / xc copy / xt sort",
+    ),
     ("!", "diagnostics — collector errors, port conflicts"),
     ("?", "this help"),
     ("q", "quit"),
@@ -519,7 +554,7 @@ pub const FOOTER_HINTS: &[(&str, &str)] = &[
     ("h/l", "fold"),
     ("Tab", "facet"),
     ("/", "filter"),
-    ("d", "dump"),
+    ("x", "cmds"),
     ("?", "help"),
 ];
 
@@ -675,6 +710,7 @@ mod tests {
         // Select the shell process row; it holds no sockets in this fixture.
         handle(&mut app, key(KeyCode::Char('j')));
         handle(&mut app, key(KeyCode::Char('j')));
+        handle(&mut app, key(KeyCode::Char('x')));
         handle(&mut app, key(KeyCode::Char('d')));
         assert!(
             app.modal.is_none(),
@@ -692,7 +728,8 @@ mod tests {
             .position(|row| matches!(row.kind, Kind::Process { .. }))
             .expect("fixture has a process row");
         app.selected = process_row;
-        handle(&mut app, key(KeyCode::Char('K')));
+        handle(&mut app, key(KeyCode::Char('x')));
+        handle(&mut app, key(KeyCode::Char('k')));
         match &app.modal {
             Some(Modal::Confirm { command, .. }) => assert!(command.starts_with("kill -TERM")),
             _ => panic!("expected a confirmation modal"),
@@ -707,7 +744,8 @@ mod tests {
             .iter()
             .position(|row| matches!(row.kind, Kind::Process { .. }))
             .unwrap();
-        handle(&mut app, key(KeyCode::Char('K')));
+        handle(&mut app, key(KeyCode::Char('x')));
+        handle(&mut app, key(KeyCode::Char('k')));
         assert!(app.modal.is_some());
         handle(&mut app, key(KeyCode::Esc));
         assert!(app.modal.is_none());
@@ -798,6 +836,10 @@ mod capture_tests {
             .expect("fixture has a process row");
         app.selected = process_row;
 
+        handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
         handle(
             &mut app,
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
