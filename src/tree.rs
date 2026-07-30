@@ -72,6 +72,9 @@ pub struct Row {
     /// Which pane this row belongs to, set only in flat orderings where the tree
     /// no longer shows it.
     pub flat_context: Option<String>,
+    /// The cwd of the pane this process belongs to — the session root for a
+    /// Claude process, available in both tree and flat orderings.
+    pub pane_cwd: Option<String>,
 }
 
 impl Row {
@@ -406,6 +409,9 @@ struct Ctx<'a> {
     noise: Noise,
     /// Listen ports held by more than one process, computed once per build.
     conflicts: HashMap<u16, Vec<ProcKey>>,
+    /// The cwd of the pane whose subtree is being built, so Claude session
+    /// resolution works in tree order without app-level lookups.
+    pane_cwd: Option<String>,
 }
 
 impl Ctx<'_> {
@@ -432,6 +438,7 @@ pub fn build(
         filtering,
         noise,
         conflicts: snapshot.port_conflicts(),
+        pane_cwd: None,
     };
     let mut rows = Vec::new();
 
@@ -471,6 +478,7 @@ pub fn build(
             port_conflict: false,
             connections: 0,
             flat_context: None,
+            pane_cwd: None,
         };
 
         let mut session_children = Vec::new();
@@ -534,6 +542,7 @@ pub fn build(
             port_conflict: false,
             connections: 0,
             flat_context: None,
+            pane_cwd: None,
         };
 
         let mut children = Vec::new();
@@ -619,6 +628,7 @@ fn build_window(ctx: &Ctx, session: &str, window_index: u32, panes: &[&Pane]) ->
         port_conflict: false,
         connections: 0,
         flat_context: None,
+        pane_cwd: None,
     }];
 
     if expanded {
@@ -647,6 +657,7 @@ fn build_pane(ctx: &Ctx, pane: &Pane) -> Vec<Row> {
         port_conflict: false,
         connections: 0,
         flat_context: None,
+        pane_cwd: None,
     }];
 
     if !expanded {
@@ -655,8 +666,15 @@ fn build_pane(ctx: &Ctx, pane: &Pane) -> Vec<Row> {
 
     // The pane's own process tree, then any container attributed to it. A
     // container is a sibling of the shell, not a child: its processes live in
-    // another pid namespace and are not descendants of the shell.
-    rows.extend(build_proc_subtree(ctx, pane.pid, 3));
+    // another pid namespace and are not descendants of the shell. The pane's
+    // cwd is passed so Claude session ids can resolve deep in the subtree.
+    let pane_cwd = Some(pane.cwd.clone());
+    rows.extend(build_proc_subtree_with_cwd(
+        ctx,
+        pane.pid,
+        3,
+        pane_cwd.as_deref(),
+    ));
     for container in containers {
         rows.extend(build_container(ctx, container, 3));
     }
@@ -665,6 +683,26 @@ fn build_pane(ctx: &Ctx, pane: &Pane) -> Vec<Row> {
 
 /// Recursive host process subtree. `depth` is the render indent, and recursion
 /// is bounded to keep a ppid cycle from blowing the stack.
+/// Like [`build_proc_subtree`], but with a pane cwd carried for Claude session
+/// resolution. The Ctx is borrowed, so rather than mutating it, a child Ctx is
+/// constructed with the cwd field set.
+fn build_proc_subtree_with_cwd(
+    ctx: &Ctx,
+    pid: u32,
+    depth: u16,
+    pane_cwd: Option<&str>,
+) -> Vec<Row> {
+    let child = Ctx {
+        snapshot: ctx.snapshot,
+        expansion: ctx.expansion,
+        filtering: ctx.filtering,
+        noise: ctx.noise,
+        conflicts: ctx.conflicts.clone(),
+        pane_cwd: pane_cwd.map(str::to_string),
+    };
+    build_proc_subtree(&child, pid, depth)
+}
+
 fn build_proc_subtree(ctx: &Ctx, pid: u32, depth: u16) -> Vec<Row> {
     const MAX_DEPTH: u16 = 32;
     if depth > MAX_DEPTH {
@@ -707,6 +745,7 @@ fn build_proc_subtree(ctx: &Ctx, pid: u32, depth: u16) -> Vec<Row> {
             .filter(|socket| socket.state == SocketState::Established)
             .count() as u32,
         flat_context: None,
+        pane_cwd: ctx.pane_cwd.clone(),
     }];
 
     if expanded {
@@ -784,6 +823,7 @@ fn build_container(ctx: &Ctx, container: &Container, depth: u16) -> Vec<Row> {
         port_conflict: false,
         connections: 0,
         flat_context: None,
+        pane_cwd: None,
     }];
 
     if expanded && let Some(procs) = procs {
@@ -851,6 +891,7 @@ fn push_container_proc(ctx: &Ctx, all: &[Proc], proc: &Proc, depth: u16, rows: &
             .filter(|socket| socket.state == SocketState::Established)
             .count() as u32,
         flat_context: None,
+        pane_cwd: ctx.pane_cwd.clone(),
     });
 
     if expanded {

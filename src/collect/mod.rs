@@ -3,6 +3,7 @@
 //! [`Snapshot`]s over a channel.
 
 pub mod capture;
+pub mod claude;
 pub mod cmd;
 pub mod container;
 pub mod host;

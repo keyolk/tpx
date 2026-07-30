@@ -85,35 +85,31 @@ fn render_body(frame: &mut Frame, area: Rect, app: &mut App, palette: Palette) {
         render_tree(frame, area, app, palette);
         return;
     }
-    // The tree is capped at the width its content actually uses, and the detail
-    // pane takes the rest. A percentage split instead gave the tree every extra
-    // column on a wide terminal, leaving the detail pane too narrow to read a
-    // socket line — the tree does not benefit from that space, the facet does.
-    let tree_width = area
-        .width
-        .saturating_sub(DETAIL_MIN_WIDTH)
-        .min(TREE_CONTENT_MAX + 2);
+    // Reserve 1 column for the vertical separator, then cap the tree at the
+    // width its content uses. Without reserving the separator, the tree's
+    // right-aligned metrics overlapped it.
+    let tree_width = (area.width.saturating_sub(DETAIL_MIN_WIDTH + 1)).min(TREE_CONTENT_MAX + 2);
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(tree_width), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(tree_width),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(area);
     render_tree(frame, panes[0], app, palette);
 
     // A single-column vertical separator — cheaper than a full box border, and
     // it does not enclose the empty rows below the content the way Borders::ALL
     // did.
-    let sep = Rect {
-        x: panes[0].x + panes[0].width,
-        y: panes[0].y,
-        width: 1,
-        height: panes[0].height,
-    };
     frame.render_widget(
-        Block::default().borders(Borders::LEFT).border_style(palette.border(false)),
-        sep,
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(palette.border(false)),
+        panes[1],
     );
 
-    render_detail(frame, panes[1], app, palette);
+    render_detail(frame, panes[2], app, palette);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
@@ -237,7 +233,10 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
     // A border around the whole area draws 40+ empty rows when there are 8
     // processes. The title alone identifies the pane; a focused border style
     // marks which side is active without enclosing empty space.
-    let title = Span::styled(" tree ", palette.fg(if focused { INFO } else { Color::Reset }));
+    let title = Span::styled(
+        " tree ",
+        palette.fg(if focused { INFO } else { Color::Reset }),
+    );
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(palette.border(focused))
@@ -359,6 +358,16 @@ fn tree_row(row: &Row, width: u16, palette: Palette, flat: bool) -> ListItem<'st
         Kind::Process { proc } => {
             spans.push(Span::raw(proc.name().to_string()));
             spans.push(Span::styled(format!("  {}", proc.key.pid), palette.dim()));
+            // A Claude Code process gets its session id shown inline — it is the
+            // identifier the reader uses to find a session in `ccx` or logs.
+            if matches!(proc.key.origin, Origin::Host)
+                && crate::collect::claude::is_claude(&proc.command)
+                && let Some(cwd) = &row.pane_cwd
+                && let Some(session) = crate::collect::claude::session_for(cwd)
+            {
+                let short = &session.session_id[..session.session_id.len().min(8)];
+                spans.push(Span::styled(format!(" ⟡{short}"), palette.fg(ACCENT)));
+            }
             // In a flat ordering the indent is gone, so the pane that owned this
             // process is spelled out — otherwise the row says what is heavy without
             // saying where it lives.
@@ -440,9 +449,18 @@ fn row_metrics(row: &Row, flat: bool) -> Vec<Span<'static>> {
         palette.dim(),
     ));
     if !row.listen_ports.is_empty() {
-        let ports: Vec<String> = row.listen_ports.iter().take(3).map(u16::to_string).collect();
+        let ports: Vec<String> = row
+            .listen_ports
+            .iter()
+            .take(3)
+            .map(u16::to_string)
+            .collect();
         let more = if row.listen_ports.len() > 3 { "+" } else { "" };
-        let style = if row.port_conflict { palette.fg(ERROR) } else { palette.fg(SUCCESS) };
+        let style = if row.port_conflict {
+            palette.fg(ERROR)
+        } else {
+            palette.fg(SUCCESS)
+        };
         // `!` marks the conflict in text, not only in red.
         let conflict = if row.port_conflict { "!" } else { "" };
         spans.push(Span::styled(
@@ -455,14 +473,20 @@ fn row_metrics(row: &Row, flat: bool) -> Vec<Span<'static>> {
         spans.push(Span::raw("       "));
     }
     if row.connections > 0 {
-        spans.push(Span::styled(format!("E:{} ", row.connections), palette.fg(INFO)));
+        spans.push(Span::styled(
+            format!("E:{} ", row.connections),
+            palette.fg(INFO),
+        ));
     } else {
         spans.push(Span::raw("    "));
     }
     // age — only for processes, but the column is part of the row so group rows
     // get spaces to keep the table aligned.
     if let Kind::Process { proc } = &row.kind {
-        spans.push(Span::styled(format!("{:>5}", human_age(proc.age_secs)), palette.dim()));
+        spans.push(Span::styled(
+            format!("{:>5}", human_age(proc.age_secs)),
+            palette.dim(),
+        ));
     } else {
         spans.push(Span::raw("     "));
     }
@@ -822,6 +846,7 @@ mod metric_tests {
             port_conflict: false,
             connections: 0,
             flat_context: Some("local:1.2".into()),
+            pane_cwd: None,
         }
     }
 
