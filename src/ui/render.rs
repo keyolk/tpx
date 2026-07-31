@@ -886,7 +886,6 @@ fn render_command_menu(frame: &mut Frame, area: Rect, palette: Palette) {
         ("xk", "send SIGTERM"),
         ("xo", "switch to pane"),
         ("xc", "copy selection"),
-        ("xt", "sort…"),
     ];
     let height = entries.len() as u16 + 4;
     let box_area = overlay(area, 40, height);

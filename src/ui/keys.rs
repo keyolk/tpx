@@ -102,12 +102,6 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Effect {
             copy_selection(app);
             Effect::None
         }
-        (Some(Modal::CommandMenu), KeyCode::Char('t')) => {
-            // Sort submenu — choose directly instead of cycling.
-            app.modal = Some(Modal::SortMenu);
-            app.touch();
-            Effect::None
-        }
         // Sort menu: number keys select the ordering directly.
         (Some(Modal::SortMenu), KeyCode::Char(ch @ '1'..='5')) => {
             let sort = match ch {
@@ -276,8 +270,16 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
             app.rebuild();
         }
 
+        // `s` opens the sort menu — pick an ordering directly instead of
+        // cycling. Was `xt` under the x-prefix, but sort is frequent enough
+        // to earn its own key.
+        KeyCode::Char('s') => {
+            app.modal = Some(Modal::SortMenu);
+            app.touch();
+        }
+
         // `x` opens the command menu — a two-keystroke prefix for extended
-        // actions (dump, stop, kill, switch, copy, sort). Keeps the main keymap
+        // actions (dump, stop, kill, switch, copy). Keeps the main keymap
         // clean while leaving room for more commands without collisions.
         KeyCode::Char('x') => {
             app.modal = Some(Modal::CommandMenu);
@@ -554,6 +556,7 @@ pub const FOOTER_HINTS: &[(&str, &str)] = &[
     ("h/l", "fold"),
     ("Tab", "facet"),
     ("/", "filter"),
+    ("s", "sort"),
     ("x", "cmds"),
     ("?", "help"),
 ];
