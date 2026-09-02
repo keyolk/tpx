@@ -111,14 +111,24 @@ fn overview_lines(app: &App, palette: Palette) -> Vec<Line<'static>> {
             // the two things needed to find the session in `ccx` or logs.
             if matches!(proc.key.origin, Origin::Host)
                 && crate::collect::claude::is_claude(&proc.command)
-                && let Some(pane) = app.selected_pane_target()
-                && let Some(p) = app.snapshot.panes.iter().find(|pp| pp.target == pane)
-                && let Some(session) = crate::collect::claude::session_for(&p.cwd)
             {
-                lines.push(Line::default());
-                lines.push(Line::styled("claude", palette.dim()));
-                lines.push(Line::raw(format!("  session  {}", session.session_id)));
-                lines.push(Line::raw(format!("  cwd      {}", session.cwd)));
+                // The pane's cwd resolves both id and project dir, but a
+                // detached worker has no pane — there, argv still carries the
+                // pinned id even though the cwd has to go unreported.
+                let from_pane = app
+                    .selected_pane_target()
+                    .and_then(|pane| app.snapshot.panes.iter().find(|pp| pp.target == pane))
+                    .and_then(|p| crate::collect::claude::session_for(&p.cwd));
+                let id = crate::collect::claude::session_id_from_argv(&proc.command)
+                    .or_else(|| from_pane.as_ref().map(|s| s.session_id.clone()));
+                if let Some(id) = id {
+                    lines.push(Line::default());
+                    lines.push(Line::styled("claude", palette.dim()));
+                    lines.push(Line::raw(format!("  session  {id}")));
+                    if let Some(session) = &from_pane {
+                        lines.push(Line::raw(format!("  cwd      {}", session.cwd)));
+                    }
+                }
             }
 
             // Where this process sits. Aggregate resource and socket totals are

@@ -79,6 +79,30 @@ pub fn session_for(cwd: &str) -> Option<ClaudeSession> {
     Some(ClaudeSession { session_id, cwd })
 }
 
+/// The session id a claude process was told to use, read from its own argv.
+///
+/// `--session-id` pins a new session, `--resume` reopens one; either way the
+/// id is right there in the command line, which beats the most-recently-touched
+/// heuristic [`session_for`] falls back to — and unlike that heuristic it needs
+/// no cwd, so it works for a process that belongs to no pane. Narwhal pins every
+/// worker's id precisely so its transcript can be found later, which is exactly
+/// the case the fallback cannot serve.
+pub fn session_id_from_argv(command: &str) -> Option<String> {
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--session-id" || token == "--resume" {
+            let id = tokens.next()?;
+            // Guard against `--resume` used with no value, where the next token
+            // is another flag rather than an id.
+            if id.starts_with('-') {
+                return None;
+            }
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 /// Whether a process name looks like a Claude Code instance.
 pub fn is_claude(command: &str) -> bool {
     let name = command.split_whitespace().next().unwrap_or("");
@@ -96,6 +120,24 @@ mod tests {
         assert!(is_claude("claude.exe --settings {\"a\":1}"));
         assert!(!is_claude("ccproxy claude --intercept=mitm"));
         assert!(!is_claude("node qmd mcp"));
+    }
+
+    #[test]
+    fn a_pinned_session_id_is_read_straight_from_argv() {
+        let worker =
+            "claude --print --session-id 6725bf4b-1a8d-472a-b9f3-cc5b7244f274 --model sonnet";
+        assert_eq!(
+            session_id_from_argv(worker).as_deref(),
+            Some("6725bf4b-1a8d-472a-b9f3-cc5b7244f274")
+        );
+        assert_eq!(
+            session_id_from_argv("claude --resume abc-123 --model default").as_deref(),
+            Some("abc-123")
+        );
+        assert!(session_id_from_argv("claude --dangerously-skip-permissions").is_none());
+        // A flag where the id should be means no id was given.
+        assert!(session_id_from_argv("claude --resume --model default").is_none());
+        assert!(session_id_from_argv("claude --session-id").is_none());
     }
 
     #[test]

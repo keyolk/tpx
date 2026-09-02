@@ -1077,18 +1077,40 @@ fn orphan_roots(snapshot: &Snapshot) -> Vec<u32> {
         .map(|proc| proc.key.pid)
         .collect();
 
+    // A root is an orphan with no kept *ancestor*, not merely no kept parent.
+    // The subtree walk renders every child regardless of `is_user_daemon`, so a
+    // process whose parent was filtered out is still drawn under whichever
+    // ancestor survived — checking only the parent promoted it to a second,
+    // duplicate root. Observed with `kmd rag --hook` under a narwhal worker:
+    // its parents (`claude`, `ccproxy`) are invoked by bare name and so are not
+    // kept, but `narwhal daemon` above them is.
     let mut roots: Vec<u32> = kept
         .iter()
         .copied()
-        .filter(|pid| {
-            snapshot
-                .proc(&ProcKey::host(*pid))
-                .is_some_and(|proc| !kept.contains(&proc.ppid))
-        })
+        .filter(|pid| !has_kept_ancestor(snapshot, *pid, &kept))
         .collect();
     // ps order is not stable between rounds; a jumping group is unreadable.
     roots.sort_unstable();
     roots
+}
+
+/// Whether any ancestor of `pid` is itself a kept orphan, meaning `pid` is
+/// already drawn inside that ancestor's subtree.
+fn has_kept_ancestor(snapshot: &Snapshot, pid: u32, kept: &HashSet<u32>) -> bool {
+    let mut seen = HashSet::new();
+    let mut current = pid;
+    while seen.insert(current) {
+        let Some(proc) = snapshot.proc(&ProcKey::host(current)) else {
+            return false;
+        };
+        if kept.contains(&proc.ppid) {
+            return true;
+        }
+        current = proc.ppid;
+    }
+    // A ppid cycle: `seen` refused the repeat, so the walk stops rather than
+    // spinning. Nothing above was kept.
+    false
 }
 
 /// Every host pid the tree already accounts for: a pane's descendants, plus the
@@ -1920,6 +1942,33 @@ mod tests {
         // after it — flattening the forest would lose the run's shape.
         assert!(worker > daemon);
         assert!(rows[worker].depth > rows[daemon].depth);
+    }
+
+    #[test]
+    fn a_grandchild_under_a_kept_daemon_is_not_also_a_root() {
+        let mut snapshot = detached_fixture();
+        // The real shape, observed with a live narwhal worker: the daemon is
+        // kept (absolute path), its `ccproxy`/`claude` children are not (bare
+        // names), and a hook process below them is. Checking only the parent
+        // made that hook a second root, so it rendered twice — once inside the
+        // daemon's subtree and once at the top of the group.
+        let hook = proc(302, 301, "/Users/g/.local/bin/kmd rag --hook", 0.0);
+        snapshot.children.entry(301).or_default().push(302);
+        snapshot.procs.insert(hook.key.clone(), hook);
+
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter {
+                query: "kmd".into(),
+            },
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.label() == "kmd").count(),
+            1,
+            "the hook is drawn under the daemon, so it is not also a root"
+        );
     }
 
     #[test]

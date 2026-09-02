@@ -370,10 +370,15 @@ fn tree_row(row: &Row, width: u16, palette: Palette, flat: bool) -> ListItem<'st
             // identifier the reader uses to find a session in `ccx` or logs.
             if matches!(proc.key.origin, Origin::Host)
                 && crate::collect::claude::is_claude(&proc.command)
-                && let Some(cwd) = &row.pane_cwd
-                && let Some(session) = crate::collect::claude::session_for(cwd)
+                // argv first: it is exact, and it is the only source for a
+                // detached claude, which has no pane and so no pane cwd.
+                && let Some(id) = crate::collect::claude::session_id_from_argv(&proc.command)
+                    .or_else(|| {
+                        let cwd = row.pane_cwd.as_deref()?;
+                        Some(crate::collect::claude::session_for(cwd)?.session_id)
+                    })
             {
-                let short = &session.session_id[..session.session_id.len().min(8)];
+                let short = &id[..id.len().min(8)];
                 spans.push(Span::styled(format!(" ⟡{short}"), palette.fg(ACCENT)));
             }
             // In a flat ordering the indent is gone, so the pane that owned this
