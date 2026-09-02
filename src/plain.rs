@@ -8,7 +8,9 @@ use anyhow::Result;
 
 use crate::collect;
 use crate::model::{CollectError, Snapshot, human_age, human_bytes};
-use crate::tree::{self, Expansion, Filter, Kind, Noise, Row, Scope};
+use crate::tree::{
+    self, CONTAINERS_GROUP, DETACHED_GROUP, Expansion, Filter, Kind, Noise, Row, Scope,
+};
 
 /// What `--plain` prints.
 pub struct Options {
@@ -179,10 +181,16 @@ fn plain_row(row: &Row) -> String {
             attached,
             window_count,
         } => {
-            format!(
-                "{indent}session {name}  {window_count}w{}",
-                if *attached { " attached" } else { "" }
-            )
+            // The synthetic groups borrow this row kind but hold no windows and
+            // are not tmux sessions, so neither `session` nor `Nw` applies.
+            if name == CONTAINERS_GROUP || name == DETACHED_GROUP {
+                format!("{indent}{name}  {window_count}")
+            } else {
+                format!(
+                    "{indent}session {name}  {window_count}w{}",
+                    if *attached { " attached" } else { "" }
+                )
+            }
         }
         Kind::Window {
             name,

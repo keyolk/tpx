@@ -121,24 +121,11 @@ fn overview_lines(app: &App, palette: Palette) -> Vec<Line<'static>> {
                 lines.push(Line::raw(format!("  cwd      {}", session.cwd)));
             }
 
-            // Where this process sits: the pane it belongs to and its subtree
-            // footprint. Cheap to compute, and it answers "is this the whole
-            // story or just one branch".
+            // Where this process sits. Aggregate resource and socket totals are
+            // appended below in the same shape used by every parent row.
             if let Some(pane) = app.selected_pane_target() {
                 lines.push(Line::default());
                 lines.push(field("pane", pane, palette));
-            }
-            if row.rollup.proc_count > 1 {
-                lines.push(field(
-                    "subtree",
-                    format!(
-                        "{} procs · {:.1}%cpu · {}",
-                        row.rollup.proc_count,
-                        row.rollup.cpu_pct,
-                        human_bytes(row.rollup.rss_bytes)
-                    ),
-                    palette,
-                ));
             }
         }
         Kind::Pane { pane } => {
@@ -152,14 +139,6 @@ fn overview_lines(app: &App, palette: Palette) -> Vec<Line<'static>> {
             lines.push(field("cwd", pane.cwd.clone(), palette));
             lines.push(field("command", pane.current_command.clone(), palette));
             lines.push(field("shell pid", pane.pid.to_string(), palette));
-            lines.push(Line::default());
-            lines.push(field(
-                "subtree",
-                format!("{} procs", row.rollup.proc_count),
-                palette,
-            ));
-            lines.push(field("cpu", format!("{:.1}%", row.rollup.cpu_pct), palette));
-            lines.push(field("rss", human_bytes(row.rollup.rss_bytes), palette));
         }
         Kind::Container { container } => {
             lines.push(field("name", container.name.clone(), palette));
@@ -185,17 +164,11 @@ fn overview_lines(app: &App, palette: Palette) -> Vec<Line<'static>> {
             }
             if let Some(metrics) = &container.metrics {
                 lines.push(Line::default());
-                lines.push(field("cpu", format!("{:.1}%", metrics.cpu_pct), palette));
                 lines.push(field(
-                    "mem",
-                    format!(
-                        "{} / {}",
-                        human_bytes(metrics.mem_bytes),
-                        human_bytes(metrics.mem_limit_bytes)
-                    ),
+                    "mem limit",
+                    human_bytes(metrics.mem_limit_bytes),
                     palette,
                 ));
-                lines.push(field("pids", metrics.pids.to_string(), palette));
                 lines.push(field(
                     "net",
                     format!(
@@ -224,9 +197,6 @@ fn overview_lines(app: &App, palette: Palette) -> Vec<Line<'static>> {
             lines.push(field("session", name.clone(), palette));
             lines.push(field("windows", window_count.to_string(), palette));
             lines.push(field("attached", attached.to_string(), palette));
-            lines.push(field("procs", row.rollup.proc_count.to_string(), palette));
-            lines.push(field("cpu", format!("{:.1}%", row.rollup.cpu_pct), palette));
-            lines.push(field("rss", human_bytes(row.rollup.rss_bytes), palette));
         }
         Kind::Window {
             name,
@@ -238,10 +208,37 @@ fn overview_lines(app: &App, palette: Palette) -> Vec<Line<'static>> {
             lines.push(field("window", format!("{index}:{name}"), palette));
             lines.push(field("panes", pane_count.to_string(), palette));
             lines.push(field("active", active.to_string(), palette));
-            lines.push(field("procs", row.rollup.proc_count.to_string(), palette));
-            lines.push(field("cpu", format!("{:.1}%", row.rollup.cpu_pct), palette));
-            lines.push(field("rss", human_bytes(row.rollup.rss_bytes), palette));
         }
+    }
+
+    // Parent rows answer "what does everything below this cost?" in one stable
+    // block. A leaf process already shows its own cpu/rss above, so avoid
+    // repeating identical values unless it actually owns a subtree.
+    let has_subtree = !matches!(row.kind, Kind::Process { .. }) || row.rollup.proc_count > 1;
+    if has_subtree {
+        lines.push(Line::default());
+        lines.push(Line::styled("aggregate", palette.dim()));
+        lines.push(field(
+            "  processes",
+            row.rollup.proc_count.to_string(),
+            palette,
+        ));
+        lines.push(field(
+            "  cpu",
+            format!("{:.1}%", row.rollup.cpu_pct),
+            palette,
+        ));
+        lines.push(field("  rss", human_bytes(row.rollup.rss_bytes), palette));
+        lines.push(field(
+            "  listeners",
+            row.rollup.listen_ports.to_string(),
+            palette,
+        ));
+        lines.push(field(
+            "  established",
+            row.rollup.established_connections.to_string(),
+            palette,
+        ));
     }
     lines
 }

@@ -84,6 +84,22 @@ impl Proc {
     /// swamps the tree structure it is supposed to annotate. These are the same
     /// rules `tmux.sh procs` used, which is what made its output readable.
     pub fn display_command(&self, max_width: usize) -> String {
+        truncate_display(&self.cleaned_command(), max_width)
+    }
+
+    /// Arguments without argv[0], compacted for the tree row. The process name is
+    /// already the row label, so repeating it would spend the limited label budget
+    /// without adding information.
+    pub fn display_argv(&self, max_width: usize) -> String {
+        let command = self.cleaned_command();
+        let argv = command
+            .split_once(char::is_whitespace)
+            .map(|(_, argv)| argv.trim_start())
+            .unwrap_or("");
+        truncate_display(argv, max_width)
+    }
+
+    fn cleaned_command(&self) -> String {
         let home = std::env::var("HOME").unwrap_or_default();
         let mut command = self.command.clone();
         if !home.is_empty() {
@@ -92,7 +108,7 @@ impl Proc {
         for prefix in NOISE_PATH_PREFIXES {
             command = strip_path_prefixes(&command, prefix);
         }
-        truncate_display(&command, max_width)
+        command
     }
 }
 
@@ -382,6 +398,7 @@ pub struct Rollup {
     pub cpu_pct: f32,
     pub rss_bytes: u64,
     pub listen_ports: u32,
+    pub established_connections: u32,
 }
 
 impl Rollup {
@@ -396,6 +413,7 @@ impl Rollup {
         self.cpu_pct += other.cpu_pct;
         self.rss_bytes += other.rss_bytes;
         self.listen_ports += other.listen_ports;
+        self.established_connections += other.established_connections;
     }
 }
 
@@ -464,6 +482,17 @@ mod tests {
     fn proc_name_strips_path_and_args() {
         assert_eq!(proc_with(1, "/opt/homebrew/bin/fish -l").name(), "fish");
         assert_eq!(proc_with(1, "cargo run --release").name(), "cargo");
+    }
+
+    #[test]
+    fn display_argv_omits_executable_and_respects_width() {
+        let proc = proc_with(
+            1,
+            "/opt/homebrew/bin/cargo run --release --features very-long-feature-name",
+        );
+        assert_eq!(proc.display_argv(20), "run --release --f...");
+        assert!(unicode_width::UnicodeWidthStr::width(proc.display_argv(20).as_str()) <= 20);
+        assert_eq!(proc_with(2, "fish").display_argv(20), "");
     }
 
     #[test]

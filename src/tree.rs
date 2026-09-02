@@ -11,7 +11,7 @@ mod filter;
 pub use filter::Filter;
 use filter::retain_matches_with_ancestors;
 
-use crate::model::{Container, Pane, Proc, ProcKey, Rollup, Snapshot, SocketState};
+use crate::model::{Container, Origin, Pane, Proc, ProcKey, Rollup, Snapshot, SocketState};
 
 /// Identity of a row, stable across snapshots so selection and expansion
 /// survive a refresh. A row index would not — processes come and go.
@@ -229,6 +229,9 @@ impl Expansion {
     /// chains that are the whole point of the view. Working from the snapshot
     /// instead of the rows has no such horizon.
     pub fn expand_everything(&mut self, snapshot: &Snapshot) {
+        // Group nodes default open, but an earlier manual fold is remembered in
+        // `collapsed`; clear it so one `E` really opens the entire tree.
+        self.collapsed.clear();
         for key in snapshot.procs.keys() {
             self.expanded_procs.insert(NodeId::Process(key.clone()));
         }
@@ -242,6 +245,33 @@ impl Expansion {
             self.expanded_procs
                 .insert(NodeId::Container(container.id.clone()));
         }
+    }
+
+    /// Fold every group and process subtree. Top-level session rows remain
+    /// visible as entry points; one `E` restores the complete tree.
+    pub fn collapse_everything(&mut self, snapshot: &Snapshot) {
+        self.expanded_procs.clear();
+        self.collapsed.clear();
+
+        for pane in &snapshot.panes {
+            self.collapsed.insert(NodeId::Session(pane.session.clone()));
+            self.collapsed
+                .insert(NodeId::Window(pane.session.clone(), pane.window_index));
+            self.collapsed.insert(NodeId::Pane(pane.target.clone()));
+        }
+        if snapshot
+            .containers
+            .iter()
+            .any(|container| container.attribution.is_none())
+        {
+            self.collapsed
+                .insert(NodeId::Session(CONTAINERS_GROUP.to_string()));
+        }
+        // The synthetic groups are not in `snapshot.panes`, so they have to be
+        // folded by name or `E` would leave them expanded while everything else
+        // collapsed.
+        self.collapsed
+            .insert(NodeId::Session(DETACHED_GROUP.to_string()));
     }
 
     pub fn collapse_all_procs(&mut self) {
@@ -503,6 +533,65 @@ pub fn build(
         }
     }
 
+    // Processes detached from every pane — daemons that outlived the terminal
+    // that started them. `narwhal daemon` is the motivating case: it is spawned
+    // into its own process group precisely so an MCP server restart cannot kill
+    // it, which also means its workers descend from pid 1 rather than from any
+    // pane. Same reasoning as the container group above: they exist, they burn
+    // resources, and nothing else in this view would ever show them.
+    //
+    // Scoped out by default for the same reason too — belonging to no pane,
+    // they belong to no window either.
+    let detached = if *scope == Scope::Server {
+        orphan_roots(snapshot)
+    } else {
+        Vec::new()
+    };
+    if !detached.is_empty() {
+        let group_id = NodeId::Session(DETACHED_GROUP.to_string());
+        let expanded = expansion.is_expanded_for(&group_id, filtering);
+        let mut rollup = Rollup::default();
+        for pid in &detached {
+            rollup.merge(subtree_rollup(snapshot, *pid));
+        }
+        let group_row = Row {
+            id: group_id,
+            kind: Kind::Session {
+                name: DETACHED_GROUP.to_string(),
+                attached: false,
+                window_count: detached.len() as u32,
+            },
+            depth: 0,
+            expandable: true,
+            expanded,
+            rollup,
+            listen_ports: Vec::new(),
+            port_conflict: false,
+            connections: 0,
+            flat_context: None,
+            pane_cwd: None,
+        };
+
+        let mut children = Vec::new();
+        if expanded {
+            for pid in detached {
+                // No pane, so no pane cwd: a detached claude resolves its
+                // session from its own cwd or not at all.
+                children.extend(build_proc_subtree(&ctx, pid, 1));
+            }
+        }
+        if filtering {
+            let kept = retain_matches_with_ancestors(children, filter);
+            if !kept.is_empty() {
+                rows.push(group_row);
+                rows.extend(kept);
+            }
+        } else {
+            rows.push(group_row);
+            rows.extend(children);
+        }
+    }
+
     // Containers with no pane to hang under still exist and still burn
     // resources, so they get their own top-level group rather than vanishing —
     // on a machine with no compose labels and no live `docker` CLI to attribute
@@ -521,11 +610,7 @@ pub fn build(
         let expanded = expansion.is_expanded(&group_id);
         let mut rollup = Rollup::default();
         for container in &orphans {
-            if let Some(metrics) = &container.metrics {
-                rollup.cpu_pct += metrics.cpu_pct;
-                rollup.rss_bytes += metrics.mem_bytes;
-                rollup.proc_count += metrics.pids;
-            }
+            rollup.merge(container_rollup(snapshot, container));
         }
         let group_row = Row {
             id: group_id,
@@ -796,12 +881,7 @@ fn build_container(ctx: &Ctx, container: &Container, depth: u16) -> Vec<Row> {
     let expanded = ctx.expansion.is_expanded(&id);
     let procs = ctx.snapshot.container_procs.get(&container.id);
 
-    let mut rollup = Rollup::default();
-    if let Some(metrics) = &container.metrics {
-        rollup.cpu_pct = metrics.cpu_pct;
-        rollup.rss_bytes = metrics.mem_bytes;
-        rollup.proc_count = metrics.pids;
-    }
+    let rollup = container_rollup(ctx.snapshot, container);
 
     let mut rows = vec![Row {
         id,
@@ -872,8 +952,7 @@ fn push_container_proc(ctx: &Ctx, all: &[Proc], proc: &Proc, depth: u16, rows: &
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let listen_ports = listen_ports_of(sockets);
-    let mut rollup = Rollup::default();
-    rollup.add_proc(proc);
+    let rollup = container_proc_rollup(ctx.snapshot, all, proc, 0);
 
     rows.push(Row {
         id,
@@ -901,6 +980,62 @@ fn push_container_proc(ctx: &Ctx, all: &[Proc], proc: &Proc, depth: u16, rows: &
     }
 }
 
+fn container_proc_rollup(snapshot: &Snapshot, all: &[Proc], proc: &Proc, depth: u16) -> Rollup {
+    if depth > 32 {
+        return Rollup::default();
+    }
+
+    let mut rollup = Rollup::default();
+    rollup.add_proc(proc);
+    if let Some(sockets) = snapshot.sockets.get(&proc.key) {
+        rollup.listen_ports += sockets
+            .iter()
+            .filter(|socket| socket.state == SocketState::Listen)
+            .count() as u32;
+        rollup.established_connections += sockets
+            .iter()
+            .filter(|socket| socket.state == SocketState::Established)
+            .count() as u32;
+    }
+    for child in all
+        .iter()
+        .filter(|other| other.ppid == proc.key.pid && other.key != proc.key)
+    {
+        rollup.merge(container_proc_rollup(snapshot, all, child, depth + 1));
+    }
+    rollup
+}
+
+fn container_rollup(snapshot: &Snapshot, container: &Container) -> Rollup {
+    let mut rollup = Rollup::default();
+    if let Some(metrics) = &container.metrics {
+        rollup.cpu_pct = metrics.cpu_pct;
+        rollup.rss_bytes = metrics.mem_bytes;
+        rollup.proc_count = metrics.pids;
+    }
+
+    let Some(procs) = snapshot.container_procs.get(&container.id) else {
+        return rollup;
+    };
+    let by_pid: HashSet<u32> = procs.iter().map(|proc| proc.key.pid).collect();
+    let mut observed = Rollup::default();
+    for root in procs.iter().filter(|proc| !by_pid.contains(&proc.ppid)) {
+        observed.merge(container_proc_rollup(snapshot, procs, root, 0));
+    }
+
+    // Docker stats is the authoritative aggregate for resources. `docker top`
+    // fills the gap when stats is unavailable, while its socket walk enriches
+    // either source with values Docker stats does not expose.
+    if container.metrics.is_none() {
+        rollup.proc_count = observed.proc_count;
+        rollup.cpu_pct = observed.cpu_pct;
+        rollup.rss_bytes = observed.rss_bytes;
+    }
+    rollup.listen_ports = observed.listen_ports;
+    rollup.established_connections = observed.established_connections;
+    rollup
+}
+
 fn containers_for_pane<'a>(snapshot: &'a Snapshot, pane_target: &str) -> Vec<&'a Container> {
     snapshot
         .containers
@@ -913,6 +1048,132 @@ fn containers_for_pane<'a>(snapshot: &'a Snapshot, pane_target: &str) -> Vec<&'a
         })
         .collect()
 }
+
+/// Host processes that belong to no pane's subtree.
+///
+/// A process reaches the tree only by being a descendant of some pane pid
+/// (see [`build_pane`]). Anything deliberately detached from its launching
+/// terminal — a daemon that outlives the MCP server that spawned it, an
+/// `ollama serve`, a `narwhal daemon` whose workers are its children — is
+/// reparented to pid 1 and so hangs off no pane at all. Those are exactly the
+/// processes the reader is least able to find by other means, and today they
+/// are invisible.
+///
+/// Returns the *roots* of the orphan forest: an orphan whose parent is also a
+/// kept orphan is rendered as that parent's child instead, preserving the
+/// daemon → worker shape that makes the group readable.
+fn orphan_roots(snapshot: &Snapshot) -> Vec<u32> {
+    let covered = pids_under_panes(snapshot);
+    // Filtering *before* computing roots is load-bearing. `launchd` (pid 1) is
+    // itself an orphan by this definition, so with the noise still in the set
+    // every process on the machine has an orphan parent and the forest
+    // collapses to a single root.
+    let kept: HashSet<u32> = snapshot
+        .procs
+        .values()
+        .filter(|proc| proc.key.origin == Origin::Host)
+        .filter(|proc| !covered.contains(&proc.key.pid))
+        .filter(|proc| is_user_daemon(&proc.command))
+        .map(|proc| proc.key.pid)
+        .collect();
+
+    let mut roots: Vec<u32> = kept
+        .iter()
+        .copied()
+        .filter(|pid| {
+            snapshot
+                .proc(&ProcKey::host(*pid))
+                .is_some_and(|proc| !kept.contains(&proc.ppid))
+        })
+        .collect();
+    // ps order is not stable between rounds; a jumping group is unreadable.
+    roots.sort_unstable();
+    roots
+}
+
+/// Every host pid the tree already accounts for: a pane's descendants, plus the
+/// ancestors those panes hang from.
+///
+/// The ancestor half is not symmetry for its own sake. The tmux *server* is the
+/// parent of every pane shell, and it descends from no pane, so by descendants
+/// alone it is an orphan — and expanding it would redraw the entire session tree
+/// a second time inside the detached group. Walking up from each pane excludes
+/// it, and with it the login shell and terminal above it.
+fn pids_under_panes(snapshot: &Snapshot) -> HashSet<u32> {
+    let mut covered = HashSet::new();
+    let mut stack: Vec<u32> = snapshot.panes.iter().map(|pane| pane.pid).collect();
+    while let Some(pid) = stack.pop() {
+        if !covered.insert(pid) {
+            continue; // Already walked, or a ppid cycle.
+        }
+        stack.extend_from_slice(snapshot.host_children(pid));
+    }
+
+    for pane in &snapshot.panes {
+        let mut pid = pane.pid;
+        // Bounded by the process table: each step must find a real parent, and
+        // a pid already inserted ends the walk, so a ppid cycle cannot spin.
+        while let Some(proc) = snapshot.proc(&ProcKey::host(pid)) {
+            if !covered.insert(pid) && pid != pane.pid {
+                break;
+            }
+            pid = proc.ppid;
+        }
+    }
+    covered
+}
+
+/// Whether a detached process is one the reader started, rather than part of
+/// the operating system.
+///
+/// Without this the group is hundreds of rows of macOS agents on a normal
+/// desktop and the handful that matter are buried. Judging by argv[0]'s path is
+/// crude but it is the only signal `ps` gives us for free, and it is the one
+/// that separates the two populations: system daemons run from the OS-owned
+/// prefixes below (or from a bare name), while the reader's own tools run from
+/// `~/.local/bin`, `/opt/homebrew`, and the like. Measured on this machine it
+/// cuts 369 orphan roots to 9, keeping every daemon the reader launched.
+fn is_user_daemon(command: &str) -> bool {
+    const SYSTEM_PREFIXES: [&str; 8] = [
+        "/System/",
+        "/usr/libexec/",
+        "/usr/sbin/",
+        "/usr/bin/",
+        "/Library/",
+        "/Applications/",
+        "/sbin/",
+        "/bin/",
+    ];
+
+    let Some(argv0) = command.split_whitespace().next() else {
+        return false;
+    };
+    // A daemon worth showing was launched by path. Anything else — a bare
+    // `autofsd`, a `Core Audio Driver (...)` plugin host, a process that
+    // cleared its argv into `(name)` — is a system process whose argv tells us
+    // nothing and which the reader cannot act on anyway.
+    if !argv0.starts_with('/') {
+        return false;
+    }
+    if SYSTEM_PREFIXES
+        .iter()
+        .any(|prefix| argv0.starts_with(prefix))
+    {
+        return false;
+    }
+    // Per-user Apple/vendor agents live here — same population as /Library,
+    // just installed for one account.
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && argv0.starts_with(&format!("{home}/Library/")) {
+        return false;
+    }
+    true
+}
+
+/// Label of the synthetic group holding processes under no pane. Like
+/// [`CONTAINERS_GROUP`] it borrows the session row kind, being a top-level
+/// group rather than a real tmux session.
+pub const DETACHED_GROUP: &str = "detached (no pane)";
 
 /// Containers not attributed to any pane — they still exist and still burn
 /// resources, so they get their own group rather than being dropped.
@@ -950,6 +1211,10 @@ fn subtree_rollup(snapshot: &Snapshot, pid: u32) -> Rollup {
                 .iter()
                 .filter(|socket| socket.state == SocketState::Listen)
                 .count() as u32;
+            rollup.established_connections += sockets
+                .iter()
+                .filter(|socket| socket.state == SocketState::Established)
+                .count() as u32;
         }
         for child in snapshot.host_children(pid) {
             walk(snapshot, *child, depth + 1, rollup);
@@ -966,11 +1231,7 @@ fn rollup_of_pane(snapshot: &Snapshot, pane: &Pane) -> Rollup {
     // its cost is the pane's cost from the user's point of view, even though it
     // is not in the pane's process tree.
     for container in containers_for_pane(snapshot, &pane.target) {
-        if let Some(metrics) = &container.metrics {
-            rollup.cpu_pct += metrics.cpu_pct;
-            rollup.rss_bytes += metrics.mem_bytes;
-            rollup.proc_count += metrics.pids;
-        }
+        rollup.merge(container_rollup(snapshot, container));
     }
     rollup
 }
@@ -1064,6 +1325,15 @@ mod tests {
         }
     }
 
+    fn established(local_port: u16, peer_port: u16) -> Socket {
+        Socket {
+            proto: Proto::Tcp,
+            local: format!("127.0.0.1:{local_port}"),
+            peer: Some(format!("127.0.0.1:{peer_port}")),
+            state: SocketState::Established,
+        }
+    }
+
     #[test]
     fn default_view_shows_groups_but_not_process_subtrees() {
         let rows = build_all(
@@ -1106,7 +1376,11 @@ mod tests {
 
     #[test]
     fn pane_rollup_sums_the_whole_subtree() {
-        let snapshot = fixture();
+        let mut snapshot = fixture();
+        snapshot.sockets.insert(
+            ProcKey::host(102),
+            vec![listen(8080), established(51_000, 5432)],
+        );
         let rows = build_all(
             &snapshot,
             &Expansion::default(),
@@ -1117,9 +1391,11 @@ mod tests {
             .iter()
             .find(|row| matches!(row.kind, Kind::Pane { .. }))
             .unwrap();
-        // fish + cargo + rustc
+        // fish + cargo + rustc, including sockets held by the deepest child.
         assert_eq!(pane_row.rollup.proc_count, 3);
         assert_eq!(pane_row.rollup.cpu_pct, 102.0);
+        assert_eq!(pane_row.rollup.listen_ports, 1);
+        assert_eq!(pane_row.rollup.established_connections, 1);
     }
 
     #[test]
@@ -1574,5 +1850,246 @@ mod tests {
         assert_eq!(sort, Sort::Tree);
         assert!(!Sort::Tree.is_flat());
         assert!(Sort::Cpu.is_flat());
+    }
+    /// A daemon detached from every pane, plus its worker — the narwhal shape
+    /// this group exists for. pid 1 is present, as it is on a real machine,
+    /// because its presence is what breaks a naive root computation.
+    fn detached_fixture() -> Snapshot {
+        let mut snapshot = fixture();
+        for proc in [
+            proc(1, 0, "/sbin/launchd", 0.0),
+            proc(300, 1, "/Users/g/.local/bin/narwhal daemon start", 1.0),
+            proc(301, 300, "/opt/homebrew/bin/ccproxy claude --print", 40.0),
+            proc(400, 1, "/usr/libexec/secd", 0.0),
+        ] {
+            snapshot
+                .children
+                .entry(proc.ppid)
+                .or_default()
+                .push(proc.key.pid);
+            snapshot.procs.insert(proc.key.clone(), proc);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn a_daemon_under_no_pane_is_shown_in_the_detached_group() {
+        let snapshot = detached_fixture();
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter::default(),
+        );
+        assert!(
+            rows.iter().any(|row| row.label() == DETACHED_GROUP),
+            "the group header must appear"
+        );
+        assert!(
+            rows.iter().any(|row| row.label() == "narwhal"),
+            "the detached daemon must be reachable, not just counted"
+        );
+    }
+
+    #[test]
+    fn a_detached_workers_parent_is_the_daemon_not_the_group() {
+        let snapshot = detached_fixture();
+        // Process subtrees are collapsed by default, here as everywhere else,
+        // so the daemon is offered as expandable and the worker appears only
+        // once it is opened.
+        let mut expansion = Expansion::default();
+        let rows = build_all(&snapshot, &expansion, Noise::Hide, &Filter::default());
+        let daemon = rows
+            .iter()
+            .position(|row| row.label() == "narwhal")
+            .unwrap();
+        assert!(rows[daemon].expandable, "the daemon hides a worker");
+        assert!(!rows.iter().any(|row| row.label() == "ccproxy"));
+
+        expansion.toggle(&rows[daemon].id.clone());
+        let rows = build_all(&snapshot, &expansion, Noise::Hide, &Filter::default());
+        let daemon = rows
+            .iter()
+            .position(|row| row.label() == "narwhal")
+            .unwrap();
+        let worker = rows
+            .iter()
+            .position(|row| row.label() == "ccproxy")
+            .unwrap();
+        // The worker descends from the daemon, so it must render deeper and
+        // after it — flattening the forest would lose the run's shape.
+        assert!(worker > daemon);
+        assert!(rows[worker].depth > rows[daemon].depth);
+    }
+
+    #[test]
+    fn the_tmux_server_is_not_treated_as_detached() {
+        let mut snapshot = detached_fixture();
+        // The real shape: the tmux server parents every pane shell and itself
+        // descends from pid 1. Counting only descendants makes it an orphan,
+        // and expanding it would redraw every session inside the group.
+        let server = proc(50, 1, "/opt/homebrew/bin/tmux", 0.0);
+        snapshot.children.entry(1).or_default().push(50);
+        snapshot.procs.insert(server.key.clone(), server);
+        for shell in [100, 200] {
+            snapshot.children.entry(50).or_default().push(shell);
+            if let Some(proc) = snapshot.procs.get_mut(&ProcKey::host(shell)) {
+                proc.ppid = 50;
+            }
+            snapshot
+                .children
+                .entry(1)
+                .or_default()
+                .retain(|pid| *pid != shell);
+        }
+
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter {
+                query: "tmux".into(),
+            },
+        );
+        assert!(!rows.iter().any(|row| row.label() == "tmux"));
+    }
+
+    #[test]
+    fn system_daemons_are_not_swept_into_the_detached_group() {
+        let snapshot = detached_fixture();
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter::default(),
+        );
+        // /usr/libexec/secd and launchd are orphans by the same definition;
+        // showing them would bury the handful of rows that matter under ~370.
+        assert!(!rows.iter().any(|row| row.label() == "secd"));
+        assert!(!rows.iter().any(|row| row.label() == "launchd"));
+    }
+
+    #[test]
+    fn a_process_already_under_a_pane_is_not_repeated_as_detached() {
+        let snapshot = detached_fixture();
+        // A filter forces every subtree open, which is the cheapest way to see
+        // every row the build can produce and so to catch a duplicate.
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter {
+                query: "cargo".into(),
+            },
+        );
+        let cargo_rows = rows.iter().filter(|row| row.label() == "cargo").count();
+        assert_eq!(cargo_rows, 1, "cargo lives under local:1.1, not in both");
+    }
+
+    #[test]
+    fn the_detached_group_is_hidden_under_the_default_scope() {
+        let snapshot = detached_fixture();
+        let narrow = build(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter::default(),
+            &Scope::CurrentWindow,
+            Some(&("local".to_string(), 1)),
+        );
+        assert!(!narrow.iter().any(|row| row.label() == DETACHED_GROUP));
+        assert!(!narrow.iter().any(|row| row.label() == "narwhal"));
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_detached_drops_the_group_header() {
+        let snapshot = detached_fixture();
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter {
+                query: "rustc".into(),
+            },
+        );
+        assert!(
+            !rows.iter().any(|row| row.label() == DETACHED_GROUP),
+            "a header whose subtree matched nothing is noise"
+        );
+    }
+
+    #[test]
+    fn a_filter_matching_a_detached_process_keeps_it_with_its_header() {
+        let snapshot = detached_fixture();
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter {
+                query: "ccproxy".into(),
+            },
+        );
+        assert!(rows.iter().any(|row| row.label() == DETACHED_GROUP));
+        assert!(rows.iter().any(|row| row.label() == "ccproxy"));
+    }
+
+    #[test]
+    fn detached_processes_join_the_flat_orderings() {
+        let snapshot = detached_fixture();
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter::default(),
+        );
+        let flat = flatten(rows, Sort::Cpu);
+        // The whole point: `s`-sorted views could not show these at all before,
+        // because flatten only reorders rows the tree already built.
+        assert!(flat.iter().any(|row| row.label() == "narwhal"));
+    }
+
+    #[test]
+    fn a_ppid_cycle_among_detached_processes_terminates() {
+        let mut snapshot = fixture();
+        // Two processes claiming each other as parent: neither is a root by the
+        // parent test, so the group is empty rather than looping forever.
+        for proc in [
+            proc(500, 501, "/Users/g/.local/bin/a", 0.0),
+            proc(501, 500, "/Users/g/.local/bin/b", 0.0),
+        ] {
+            snapshot
+                .children
+                .entry(proc.ppid)
+                .or_default()
+                .push(proc.key.pid);
+            snapshot.procs.insert(proc.key.clone(), proc);
+        }
+        let rows = build_all(
+            &snapshot,
+            &Expansion::default(),
+            Noise::Hide,
+            &Filter::default(),
+        );
+        assert!(!rows.iter().any(|row| row.label() == "a"));
+    }
+
+    #[test]
+    fn user_daemon_classification_splits_system_from_user_paths() {
+        assert!(is_user_daemon("/Users/g/.local/bin/narwhal daemon start"));
+        assert!(is_user_daemon("/opt/homebrew/bin/ollama serve"));
+        assert!(is_user_daemon("/Users/g/.local/bin/twebd serve"));
+        assert!(!is_user_daemon("/usr/libexec/secd"));
+        assert!(!is_user_daemon("/System/Library/CoreServices/loginwindow"));
+        assert!(!is_user_daemon(
+            "/Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        // Observed on this machine: system processes ps reports by bare name,
+        // by parenthesised name, or with a parenthesised argument.
+        assert!(!is_user_daemon("autofsd"));
+        assert!(!is_user_daemon("(fileproviderd)"));
+        assert!(!is_user_daemon(
+            "Core Audio Driver (ZoomAudioDevice.driver)"
+        ));
+        assert!(!is_user_daemon(""));
     }
 }

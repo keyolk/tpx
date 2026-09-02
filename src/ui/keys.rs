@@ -201,12 +201,19 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
             // one level below what is already open, so a row-based expand would
             // need one press per level.
             app.mark_expansion_manual();
+            app.sort = Sort::Tree;
             app.expansion.expand_everything(&app.snapshot);
+            app.set_status("unfolded entire tree");
             app.rebuild();
         }
         KeyCode::Char('C') => {
             app.mark_expansion_manual();
-            app.expansion.collapse_all_procs();
+            app.sort = Sort::Tree;
+            // Filtering deliberately forces matching paths open. Clear it here so
+            // "fold entire tree" changes the visible tree immediately as promised.
+            app.filter.query.clear();
+            app.expansion.collapse_everything(&app.snapshot);
+            app.set_status("folded entire tree");
             app.rebuild();
         }
 
@@ -526,7 +533,7 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("h/l ←→", "collapse / expand"),
     ("Space", "toggle node"),
     ("g/G", "top / bottom"),
-    ("E/C", "expand / collapse all process trees"),
+    ("E/C", "unfold / fold entire tree"),
     ("Tab [ ]", "cycle facet"),
     (
         "1..6",
@@ -536,14 +543,14 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("p / P", "jump to parent process / connected peer"),
     (
         "s",
-        "cycle sort: tree / cpu / memory / newest / connections",
+        "choose sort: tree / cpu / memory / newest / connections",
     ),
     ("w", "widen scope: this window <-> whole server"),
     ("a", "toggle noise (show every process)"),
     ("r", "refresh"),
     (
         "x…",
-        "extended commands: xd dump / xs stop / xk kill / xo switch / xc copy / xt sort",
+        "extended commands: xd dump / xs stop / xk kill / xo switch / xc copy",
     ),
     ("!", "diagnostics — collector errors, port conflicts"),
     ("?", "this help"),
@@ -924,18 +931,28 @@ mod expand_tests {
     }
 
     #[test]
-    fn collapse_all_returns_every_process_level() {
+    fn collapse_all_leaves_only_top_level_groups() {
         let mut app = deep_app();
         handle(
             &mut app,
             KeyEvent::new(KeyCode::Char('E'), KeyModifiers::NONE),
         );
+        app.filter.query = "level-103".into();
+        app.rebuild();
         handle(
             &mut app,
             KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE),
         );
-        assert!(!app.rows.iter().any(|row| row.label() == "level-103"));
-        // The pane and its shell stay — collapsing processes is not collapsing groups.
-        assert!(app.rows.iter().any(|row| row.label() == "level-100"));
+        assert!(!app.filter.is_active());
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].label(), "local");
+        assert!(!app.rows[0].expanded);
+
+        // One unfold reverses the full fold, including every process depth.
+        handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::NONE),
+        );
+        assert!(app.rows.iter().any(|row| row.label() == "level-103"));
     }
 }
