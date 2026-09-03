@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::model::{Origin, human_age, human_bytes};
 use crate::palette::{self, ACCENT, ERROR, INFO, Palette, SUCCESS, WARN};
-use crate::tree::{Kind, Row, Scope, Sort};
+use crate::tree::{CONTAINERS_GROUP, DETACHED_GROUP, Kind, Row, Scope, Sort};
 
 use super::app::{App, Facet, Modal};
 use super::keys::{FOOTER_HINTS, KEYMAP};
@@ -314,13 +314,19 @@ fn tree_row(row: &Row, width: u16, palette: Palette, flat: bool) -> ListItem<'st
             window_count,
         } => {
             spans.push(Span::styled(name.clone(), palette.bold(ACCENT)));
-            spans.push(Span::styled(
+            // The synthetic groups borrow this row kind but hold no windows —
+            // their count is members, so `Nw` would be a lie. They are named,
+            // not counted.
+            let synthetic = name == CONTAINERS_GROUP || name == DETACHED_GROUP;
+            let suffix = if synthetic {
+                format!("  {window_count}")
+            } else {
                 format!(
                     "  {window_count}w{}",
                     if *attached { " ·attached" } else { "" }
-                ),
-                palette.dim(),
-            ));
+                )
+            };
+            spans.push(Span::styled(suffix, palette.dim()));
         }
         Kind::Window {
             name,
@@ -364,10 +370,15 @@ fn tree_row(row: &Row, width: u16, palette: Palette, flat: bool) -> ListItem<'st
             // identifier the reader uses to find a session in `ccx` or logs.
             if matches!(proc.key.origin, Origin::Host)
                 && crate::collect::claude::is_claude(&proc.command)
-                && let Some(cwd) = &row.pane_cwd
-                && let Some(session) = crate::collect::claude::session_for(cwd)
+                // argv first: it is exact, and it is the only source for a
+                // detached claude, which has no pane and so no pane cwd.
+                && let Some(id) = crate::collect::claude::session_id_from_argv(&proc.command)
+                    .or_else(|| {
+                        let cwd = row.pane_cwd.as_deref()?;
+                        Some(crate::collect::claude::session_for(cwd)?.session_id)
+                    })
             {
-                let short = &session.session_id[..session.session_id.len().min(8)];
+                let short = &id[..id.len().min(8)];
                 spans.push(Span::styled(format!(" ⟡{short}"), palette.fg(ACCENT)));
             }
             // In a flat ordering the indent is gone, so the pane that owned this
@@ -401,16 +412,31 @@ fn tree_row(row: &Row, width: u16, palette: Palette, flat: bool) -> ListItem<'st
         }
     }
 
-    // Right-aligned metrics, padded to the pane width. Cell width, not char
-    // count — a CJK path in a cwd would otherwise misalign every row.
+    // Reserve the fixed-width metrics first, then spend only the remaining label
+    // budget on argv. This keeps long commands from shifting or hiding columns.
     let metrics = row_metrics(row, flat);
-    let left_width: usize = spans.iter().map(|span| span.content.width()).sum();
     let metrics_width = metrics
         .iter()
         .map(|span| span.content.width())
         .sum::<usize>();
     let available = width as usize;
-    if left_width + metrics_width + 1 < available {
+    let base_left_width: usize = spans.iter().map(|span| span.content.width()).sum();
+    if let Kind::Process { proc } = &row.kind {
+        let argv_budget = available.saturating_sub(base_left_width + metrics_width);
+        // Two cells are the separator; four more ensure a truncated value carries
+        // useful text rather than showing only an ellipsis.
+        if argv_budget >= 6 {
+            let argv = proc.display_argv(argv_budget - 2);
+            if !argv.is_empty() {
+                spans.push(Span::styled(format!("  {argv}"), palette.dim()));
+            }
+        }
+    }
+
+    // Right-aligned metrics, padded to the pane width. Cell width, not char
+    // count — a CJK argument would otherwise misalign every row.
+    let left_width: usize = spans.iter().map(|span| span.content.width()).sum();
+    if left_width + metrics_width <= available {
         spans.push(Span::raw(
             " ".repeat(available - left_width - metrics_width),
         ));
@@ -843,6 +869,7 @@ mod metric_tests {
                 cpu_pct: 13.6,
                 rss_bytes: 849 * 1024 * 1024,
                 listen_ports: 0,
+                established_connections: 0,
             },
             listen_ports: vec![],
             port_conflict: false,
