@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod collect;
+pub mod keymap;
 pub mod model;
 pub mod palette;
 pub mod plain;
