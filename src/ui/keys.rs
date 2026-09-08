@@ -19,6 +19,27 @@ pub enum Effect {
 }
 
 pub fn handle(app: &mut App, key: KeyEvent) -> Effect {
+    // Ctrl+C quits from anywhere, ahead of the filter and every modal.
+    //
+    // It used to quit from nowhere: tree_key dropped every Ctrl chord on the
+    // theory that the terminal would handle it, but the terminal is in raw mode
+    // with no SIGINT handler, so nothing did. In the filter it was worse -- the
+    // chord fell through to the Char arm and typed a literal `c` into the query.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return Effect::Quit;
+    }
+
+    // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`).
+    // Rewrite them to the Latin key at the same physical position so shortcuts
+    // fire without switching the input source back. Skipped while the filter
+    // owns keys, where the jamo is the intended input.
+    let key = if app.filter_input.is_some() {
+        key
+    } else {
+        crate::keymap::normalize(key)
+    };
+
     // Filter editing swallows everything except its own control keys, so typing
     // `q` into a search does not quit.
     if app.filter_input.is_some() {
@@ -130,9 +151,9 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Effect {
 }
 
 fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
-    // Ctrl+C/Z/\/S/Q are terminal-reserved and must reach the terminal, so any
-    // Ctrl-modified key that is not explicitly ours is ignored rather than
-    // swallowed.
+    // Ctrl+C is handled in `handle`. The rest (Ctrl+Z/\/S/Q) have no binding
+    // here and are ignored rather than falling through to their unmodified
+    // meaning -- Ctrl+Q must not quit the way plain `q` does.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return Effect::None;
     }
@@ -555,6 +576,7 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("!", "diagnostics — collector errors, port conflicts"),
     ("?", "this help"),
     ("q", "quit"),
+    ("Ctrl+C", "quit from anywhere, including the filter"),
 ];
 
 /// The 6 hints that stay visible in the footer.
@@ -656,13 +678,99 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_modified_keys_are_left_to_the_terminal() {
+    fn unbound_ctrl_chords_are_ignored_rather_than_falling_through() {
+        // Ctrl+Q must not quit the way plain `q` does, and the rest have no
+        // binding at all. Ctrl+C is the exception -- see the tests below.
         let mut app = app_with_rows();
-        for ch in ['c', 'z', 's', 'q', '\\'] {
+        for ch in ['z', 's', 'q', '\\'] {
             let event = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
             assert!(matches!(handle(&mut app, event), Effect::None));
             assert!(!app.should_quit);
         }
+    }
+
+    // --- ctrl+c ------------------------------------------------------------
+
+    // Ctrl+C used to quit from nowhere: tree_key dropped every Ctrl chord on the
+    // theory that the terminal would handle it, but the terminal is in raw mode
+    // with no SIGINT handler, so nothing did.
+    #[test]
+    fn ctrl_c_quits_from_the_tree() {
+        let mut app = app_with_rows();
+        let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle(&mut app, event), Effect::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_a_modal() {
+        let mut app = app_with_rows();
+        app.modal = Some(Modal::Help);
+        let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle(&mut app, event), Effect::Quit));
+    }
+
+    // In the filter it was worse than a no-op: the chord fell through to the
+    // Char arm and typed a literal `c` into the query.
+    #[test]
+    fn ctrl_c_quits_from_the_filter_without_typing_into_it() {
+        let mut app = app_with_rows();
+        app.filter_input = Some(String::new());
+        let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle(&mut app, event), Effect::Quit));
+        assert_eq!(app.filter_input.as_deref(), Some(""));
+    }
+
+    // --- CJK input source --------------------------------------------------
+
+    // Under a Korean input source every shortcut arrives as a jamo, so without
+    // this mapping the whole keyboard goes dead until the user switches back.
+    #[test]
+    fn hangul_quits_like_latin_q() {
+        let mut app = app_with_rows();
+        // `ㅂ` sits on the physical `q` key under the 2-set layout.
+        assert!(matches!(
+            handle(&mut app, key(KeyCode::Char('ㅂ'))),
+            Effect::Quit
+        ));
+    }
+
+    #[test]
+    fn hangul_opens_the_command_menu_like_latin_x() {
+        let mut app = app_with_rows();
+        // `ㅌ` is the physical `x`, which opens the command menu.
+        handle(&mut app, key(KeyCode::Char('ㅌ')));
+        assert!(matches!(app.modal, Some(Modal::CommandMenu)));
+    }
+
+    // The command and sort menus are the second step of a two-key flow, so they
+    // have to normalize too -- otherwise `x` then `d` is half-broken.
+    #[test]
+    fn hangul_picks_a_command_menu_entry() {
+        let mut app = app_with_rows();
+        handle(&mut app, key(KeyCode::Char('x')));
+        assert!(matches!(app.modal, Some(Modal::CommandMenu)));
+        // `ㅇ` is the physical `d`.
+        let via_jamo = handle(&mut app, key(KeyCode::Char('ㅇ')));
+
+        let mut latin_app = app_with_rows();
+        handle(&mut latin_app, key(KeyCode::Char('x')));
+        let via_latin = handle(&mut latin_app, key(KeyCode::Char('d')));
+
+        assert_eq!(
+            std::mem::discriminant(&via_jamo),
+            std::mem::discriminant(&via_latin),
+            "ㅇ must reach the same command as d"
+        );
+    }
+
+    // A jamo typed into the filter is the query -- a Korean process name would
+    // otherwise be unsearchable.
+    #[test]
+    fn the_filter_keeps_hangul_verbatim() {
+        let mut app = app_with_rows();
+        app.filter_input = Some(String::new());
+        handle(&mut app, key(KeyCode::Char('ㅂ')));
+        assert_eq!(app.filter_input.as_deref(), Some("ㅂ"));
     }
 
     #[test]
