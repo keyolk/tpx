@@ -184,6 +184,17 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
         ));
     }
 
+    // Marks survive scope changes, filters and refreshes, so the count is in the
+    // header where state lives — a marked pane scrolled out of view must not be
+    // forgotten before `xj` moves it.
+    if !app.marks.is_empty() {
+        let panes = app.marked_panes().len();
+        spans.push(Span::styled(
+            format!("  ✔{} marked ({panes}p) — xj/xb", app.marks.len()),
+            palette.bold(SUCCESS),
+        ));
+    }
+
     // A filter changes what the tree means, so it is stated in the header, not
     // just in the footer where it could be missed.
     if app.filter.is_active() || app.filter_input.is_some() {
@@ -258,15 +269,22 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
         return;
     }
 
+    // The mark column exists only while something is marked. Reserving it
+    // always would spend a column of every row on a mode that is usually off;
+    // adding it for the duration keeps the rows aligned with each other, which
+    // is the alignment that matters.
+    let marking = !app.marks.is_empty();
     let items: Vec<ListItem> = app
         .rows
         .iter()
         .map(|row| {
+            let marked = marking.then(|| app.is_marked(&row.id) || marked_by_ancestor(app, row));
             tree_row(
                 row,
                 inner.width.min(TREE_CONTENT_MAX),
                 palette,
                 app.sort.is_flat(),
+                marked,
             )
         })
         .collect();
@@ -282,8 +300,36 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-fn tree_row(row: &Row, width: u16, palette: Palette, flat: bool) -> ListItem<'static> {
+/// Whether a pane row is marked by way of its window — marking a window marks
+/// every pane in it, and showing only the window row as marked would understate
+/// what a move is about to touch.
+fn marked_by_ancestor(app: &App, row: &Row) -> bool {
+    let Kind::Pane { pane } = &row.kind else {
+        return false;
+    };
+    app.is_marked(&crate::tree::NodeId::Window(
+        pane.session.clone(),
+        pane.window_index,
+    ))
+}
+
+fn tree_row(
+    row: &Row,
+    width: u16,
+    palette: Palette,
+    flat: bool,
+    marked: Option<bool>,
+) -> ListItem<'static> {
     let mut spans = Vec::new();
+
+    if let Some(marked) = marked {
+        let glyph = match (marked, supports_unicode()) {
+            (true, true) => "✔ ",
+            (true, false) => "* ",
+            (false, _) => "  ",
+        };
+        spans.push(Span::styled(glyph, palette.bold(SUCCESS)));
+    }
 
     // Indent + fold marker. The marker column is always present so labels line
     // up whether or not a row is expandable.
@@ -913,6 +959,8 @@ fn render_command_menu(frame: &mut Frame, area: Rect, palette: Palette) {
         ("xk", "send SIGTERM"),
         ("xo", "switch to pane"),
         ("xc", "copy selection"),
+        ("xj", "move marked panes here"),
+        ("xb", "break out to a new window"),
     ];
     let height = entries.len() as u16 + 4;
     let box_area = overlay(area, 40, height);

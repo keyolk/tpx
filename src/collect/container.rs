@@ -744,6 +744,8 @@ UPTIME\t1031222.66\n";
             window_active: false,
             session_attached: true,
             zoomed: false,
+            pane_id: format!("%{pid}"),
+            window_id: format!("@{session}"),
         }
     }
 

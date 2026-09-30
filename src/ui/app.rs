@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::collect::{self, Collector, Update, capture::Capture};
-use crate::model::{Container, Origin, Proc, ProcKey, Snapshot, Socket};
+use crate::model::{Container, Origin, Pane, Proc, ProcKey, Snapshot, Socket};
 use crate::tree::{self, Expansion, Filter, Kind, NodeId, Noise, Row, Scope, Sort};
 
 /// Facets of the selected row, shown in the detail pane as tabs.
@@ -97,6 +97,10 @@ pub enum PendingAction {
     CaptureContainer { id: String, name: String },
     /// Send a signal to a host process.
     Signal { pid: u32, signal: &'static str },
+    /// Rearrange tmux panes — join marked panes into a window, or break them
+    /// out into one. The whole plan is carried so the confirmation shows every
+    /// command that will run.
+    Rearrange { plan: collect::tmux::Plan },
 }
 
 /// stdout/stderr content, or the reason there is none. The error is cached too —
@@ -148,6 +152,11 @@ pub struct App {
     /// The window tpx runs in, resolved once at startup. `None` outside tmux.
     pub current_window: Option<(String, u32)>,
     pub selected: usize,
+    /// Rows the reader has marked, in the order they marked them.
+    ///
+    /// Order is the point: `join` splits the destination once per pane, so the
+    /// marks decide the resulting layout. A set would make that arbitrary.
+    pub marks: Vec<NodeId>,
     pub facet: Facet,
     pub modal: Option<Modal>,
     /// Typing into the filter. Held separately so `/` can be cancelled with the
@@ -231,6 +240,7 @@ impl App {
             peers: None,
             current_window: collect::tmux::current_window(),
             selected: 0,
+            marks: Vec::new(),
             facet: Facet::Overview,
             modal: None,
             filter_input: None,
@@ -802,6 +812,169 @@ impl App {
         }
     }
 
+    // --- marks ------------------------------------------------------------
+
+    /// What marking the selected row means, or `None` when the row is not part
+    /// of the tmux topology.
+    ///
+    /// A process or container row marks the pane that owns it: the reader is
+    /// looking at *that claude*, and "move this somewhere else" means its pane.
+    /// Session rows — including the synthetic container and detached groups —
+    /// are not movable, so they mark nothing.
+    pub fn mark_target(&self) -> Option<NodeId> {
+        match &self.selected_row()?.kind {
+            Kind::Window { .. } => Some(self.selected_row()?.id.clone()),
+            Kind::Pane { pane } => Some(NodeId::Pane(pane.target.clone())),
+            // `flat_context` is the fallback for flat orderings, where there is
+            // no pane row above to walk back to but the row still knows which
+            // pane it came from.
+            Kind::Process { .. } | Kind::Container { .. } => self
+                .selected_pane_target()
+                .or_else(|| self.selected_row()?.flat_context.clone())
+                .map(NodeId::Pane),
+            Kind::Session { .. } => None,
+        }
+    }
+
+    pub fn is_marked(&self, id: &NodeId) -> bool {
+        self.marks.contains(id)
+    }
+
+    /// Mark or unmark the selected row. Returns what happened, for the status
+    /// line — a mark that produced no visible change would read as a dropped
+    /// keypress.
+    pub fn toggle_mark(&mut self) {
+        let Some(id) = self.mark_target() else {
+            self.set_error("only panes and windows can be marked");
+            return;
+        };
+        match self.marks.iter().position(|mark| *mark == id) {
+            Some(index) => {
+                self.marks.remove(index);
+                let count = self.marks.len();
+                self.set_status(format!("unmarked — {count} marked"));
+            }
+            None => {
+                self.marks.push(id);
+                let count = self.marks.len();
+                self.set_status(format!("marked — {count} marked"));
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub fn clear_marks(&mut self) {
+        if self.marks.is_empty() {
+            return;
+        }
+        self.marks.clear();
+        self.set_status("marks cleared");
+        self.dirty = true;
+    }
+
+    /// The marked rows resolved to panes, in mark order, deduplicated.
+    ///
+    /// A marked window resolves to all of its panes — that is what "merge this
+    /// window into that one" has to mean. Marks that no longer resolve (the
+    /// pane closed since) are dropped silently: the plan is built from what
+    /// exists now, and the count shown in the confirmation is the truth.
+    pub fn marked_panes(&self) -> Vec<Pane> {
+        let mut out: Vec<Pane> = Vec::new();
+        for mark in &self.marks {
+            let matching = self.snapshot.panes.iter().filter(|pane| match mark {
+                NodeId::Pane(target) => pane.target == *target,
+                NodeId::Window(session, index) => {
+                    pane.session == *session && pane.window_index == *index
+                }
+                _ => false,
+            });
+            for pane in matching {
+                if !out.iter().any(|kept| kept.pane_id == pane.pane_id) {
+                    out.push(pane.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Panes a rearrange should act on: the marks, or the selected row's pane
+    /// when nothing is marked.
+    ///
+    /// Falling back to the selection keeps the single-pane case a two-keystroke
+    /// operation instead of mark-then-act.
+    pub fn rearrange_sources(&self) -> Vec<Pane> {
+        let marked = self.marked_panes();
+        if !marked.is_empty() {
+            return marked;
+        }
+        self.selected_pane_target()
+            .and_then(|target| self.pane(&target).cloned())
+            .into_iter()
+            .collect()
+    }
+
+    pub fn pane(&self, target: &str) -> Option<&Pane> {
+        self.snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.target == target)
+    }
+
+    /// The destination of a join: the selected pane, or the active pane of the
+    /// selected window.
+    ///
+    /// A window row is the natural thing to aim at when merging, but `join-pane`
+    /// splits a *pane*, so the window's active pane stands in for it.
+    pub fn join_destination(&self) -> Option<Pane> {
+        match &self.selected_row()?.kind {
+            Kind::Window { index, .. } => {
+                let NodeId::Window(session, _) = &self.selected_row()?.id else {
+                    return None;
+                };
+                let in_window = self
+                    .snapshot
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.session == *session && pane.window_index == *index);
+                let mut first = None;
+                for pane in in_window {
+                    if pane.active {
+                        return Some(pane.clone());
+                    }
+                    first.get_or_insert(pane);
+                }
+                first.cloned()
+            }
+            _ => self
+                .selected_pane_target()
+                .and_then(|target| self.pane(&target).cloned()),
+        }
+    }
+
+    /// Apply a rearrange plan and resync everything it invalidated.
+    pub fn run_rearrange(&mut self, plan: &collect::tmux::Plan) {
+        match plan.run() {
+            Ok(()) => {
+                self.marks.clear();
+                // tpx may have moved itself: if its own pane was in the plan, the
+                // window it reports as "this window" is now a different one, and
+                // the narrow scope would keep showing the window it left.
+                self.current_window = collect::tmux::current_window();
+                // Pane targets are positional, so every cached capture keyed by
+                // one may now belong to a different pane.
+                self.detail.pane_output.clear();
+                self.collector.request();
+                self.set_status(plan.title.clone());
+            }
+            Err(error) => {
+                // Part of the plan may have applied; refresh so the tree shows
+                // what actually happened rather than what was intended.
+                self.collector.request();
+                self.set_error(format!("tmux: {error}"));
+            }
+        }
+    }
+
     pub fn expansion_toggle(&mut self) {
         self.user_set_expansion = true;
         let Some(row) = self.selected_row() else {
@@ -873,6 +1046,8 @@ mod tests {
             window_active: true,
             session_attached: true,
             zoomed: false,
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
         }];
         for (pid, ppid) in [(100u32, 1u32), (101, 100), (102, 100)] {
             let proc = Proc {
@@ -972,6 +1147,8 @@ mod tests {
             window_active: true,
             session_attached: true,
             zoomed: false,
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
         }];
         for (pid, ppid, command) in [
             (100u32, 1u32, "fish"),
@@ -1022,6 +1199,8 @@ mod tests {
             window_active: true,
             session_attached: true,
             zoomed: false,
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
         }];
         for (pid, ppid) in [(100u32, 1u32), (101, 100)] {
             let proc = Proc {

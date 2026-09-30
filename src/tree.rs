@@ -1297,6 +1297,8 @@ mod tests {
             window_active: false,
             session_attached: true,
             zoomed: false,
+            pane_id: format!("%{session}{window}{index}"),
+            window_id: format!("@{session}{window}"),
         }
     }
 
