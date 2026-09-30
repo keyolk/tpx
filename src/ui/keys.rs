@@ -123,6 +123,14 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Effect {
             copy_selection(app);
             Effect::None
         }
+        (Some(Modal::CommandMenu), KeyCode::Char('j')) => {
+            app.modal = None;
+            request_join(app)
+        }
+        (Some(Modal::CommandMenu), KeyCode::Char('b')) => {
+            app.modal = None;
+            request_break(app)
+        }
         // Sort menu: number keys select the ordering directly.
         (Some(Modal::SortMenu), KeyCode::Char(ch @ '1'..='5')) => {
             let sort = match ch {
@@ -253,6 +261,11 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
         // gets a key of its own rather than firing when the facet is opened.
         KeyCode::Char('S') => app.sample_selected(),
 
+        // Marking. Panes and windows only — the selection is what moves, and a
+        // process moves by way of its pane.
+        KeyCode::Char('m') => app.toggle_mark(),
+        KeyCode::Char('M') => app.clear_marks(),
+
         // Jumps. Distinct from h/l, which move within the display: these follow a
         // *relationship*, which may lead anywhere in the tree.
         KeyCode::Char('p') => app.jump_to_parent(),
@@ -265,10 +278,17 @@ fn tree_key(app: &mut App, key: KeyEvent) -> Effect {
             app.filter_input = Some(app.filter.query.clone());
             app.touch();
         }
+        // Esc drops the transient state — filter first, then marks.
+        //
+        // Marks also have `M`, but a Korean input source cannot produce it:
+        // shift+ㅡ is still ㅡ, so the physical-position map has no uppercase to
+        // rewrite it to. Esc is reachable from every layout.
         KeyCode::Esc => {
             if app.filter.is_active() {
                 app.filter.query.clear();
                 app.rebuild();
+            } else {
+                app.clear_marks();
             }
         }
         KeyCode::Char('w') => {
@@ -494,6 +514,10 @@ fn run_action(app: &mut App, action: PendingAction) -> Effect {
             }
             Effect::None
         }
+        PendingAction::Rearrange { plan } => {
+            app.run_rearrange(&plan);
+            Effect::None
+        }
         PendingAction::Signal { pid, signal } => {
             match collect::cmd::run(
                 "kill",
@@ -509,6 +533,68 @@ fn run_action(app: &mut App, action: PendingAction) -> Effect {
             Effect::None
         }
     }
+}
+
+/// Ask to move the marked panes into the selected window.
+///
+/// Marks are required rather than falling back to the selection: a join has two
+/// ends, and inferring the source from the same row that names the destination
+/// would move a pane into itself.
+fn request_join(app: &mut App) -> Effect {
+    let sources = app.marked_panes();
+    if sources.is_empty() {
+        app.set_error("mark panes or windows with m first, then select where they go");
+        return Effect::None;
+    }
+    let Some(dest) = app.join_destination() else {
+        app.set_error("select a pane or window to move them into");
+        return Effect::None;
+    };
+    let plan = collect::tmux::join_plan(&sources, &dest, &app.snapshot.panes);
+    if plan.is_empty() {
+        app.set_error(format!(
+            "every marked pane is already in {}:{}",
+            dest.session, dest.window_index
+        ));
+        return Effect::None;
+    }
+    confirm_rearrange(app, plan);
+    Effect::None
+}
+
+/// Ask to break the marked panes (or the selected one) out into a new window.
+fn request_break(app: &mut App) -> Effect {
+    let sources = app.rearrange_sources();
+    let Some(first) = sources.first() else {
+        app.set_error("select a pane to break out");
+        return Effect::None;
+    };
+    // tmux refuses to break the only pane of a window, and the refusal reads as
+    // a failure rather than as "there is nothing to do".
+    let alone = sources.len() == 1
+        && app
+            .snapshot
+            .panes
+            .iter()
+            .filter(|pane| pane.window_id == first.window_id)
+            .count()
+            <= 1;
+    if alone {
+        app.set_error(format!("{} is already alone in its window", first.target));
+        return Effect::None;
+    }
+    let plan = collect::tmux::break_plan(&sources, &app.snapshot.panes);
+    confirm_rearrange(app, plan);
+    Effect::None
+}
+
+fn confirm_rearrange(app: &mut App, plan: collect::tmux::Plan) {
+    app.modal = Some(Modal::Confirm {
+        title: plan.title.clone(),
+        command: plan.preview(),
+        action: PendingAction::Rearrange { plan },
+    });
+    app.touch();
 }
 
 fn switch_to_pane(app: &mut App) -> Effect {
@@ -563,6 +649,10 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("/", "fuzzy filter (Esc clears)"),
     ("p / P", "jump to parent process / connected peer"),
     (
+        "m / M",
+        "mark pane or window / clear marks (Esc also clears)",
+    ),
+    (
         "s",
         "choose sort: tree / cpu / memory / newest / connections",
     ),
@@ -572,6 +662,10 @@ pub const KEYMAP: &[(&str, &str)] = &[
     (
         "x…",
         "extended commands: xd dump / xs stop / xk kill / xo switch / xc copy",
+    ),
+    (
+        "xj / xb",
+        "move marked panes here / break out to a new window",
     ),
     ("!", "diagnostics — collector errors, port conflicts"),
     ("?", "this help"),
@@ -615,6 +709,8 @@ mod tests {
             window_active: true,
             session_attached: true,
             zoomed: false,
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
         }];
         for (pid, ppid) in [(100u32, 1u32), (101, 100)] {
             let proc = Proc {
@@ -891,6 +987,221 @@ mod tests {
         handle(&mut app, key(KeyCode::Char('h')));
         assert!(app.rows[app.selected].depth < depth);
     }
+
+    // --- marks and rearranging ---------------------------------------------
+
+    /// Two windows, two panes each, with a process under every pane.
+    fn app_with_two_windows() -> App {
+        let mut app = App::new(crate::tree::Scope::Server);
+        let mut snapshot = Snapshot::default();
+        let mut pid = 100u32;
+        for window in 1..=2u32 {
+            for index in 1..=2u32 {
+                snapshot.panes.push(Pane {
+                    session: "local".into(),
+                    window_index: window,
+                    window_name: format!("w{window}"),
+                    pane_index: index,
+                    target: format!("local:{window}.{index}"),
+                    cwd: "/src".into(),
+                    current_command: "fish".into(),
+                    pid,
+                    active: index == 1,
+                    window_active: window == 1,
+                    session_attached: true,
+                    zoomed: false,
+                    pane_id: format!("%{window}{index}"),
+                    window_id: format!("@{window}"),
+                });
+                let proc = Proc {
+                    key: ProcKey::host(pid),
+                    ppid: 1,
+                    command: format!("proc-{pid}"),
+                    age_secs: 1,
+                    cpu_pct: 0.0,
+                    cpu_time_secs: 0.0,
+                    rss_bytes: 0,
+                    state: "S".into(),
+                    threads: None,
+                    fd_count: None,
+                };
+                snapshot.children.entry(1).or_default().push(pid);
+                snapshot.procs.insert(proc.key.clone(), proc);
+                pid += 1;
+            }
+        }
+        app.snapshot = snapshot;
+        app.expansion.expand_everything(&app.snapshot.clone());
+        app.rebuild();
+        app
+    }
+
+    fn select(app: &mut App, predicate: impl Fn(&crate::tree::Row) -> bool) {
+        app.selected = app.rows.iter().position(predicate).expect("row not found");
+    }
+
+    #[test]
+    fn marking_a_process_row_marks_the_pane_that_owns_it() {
+        // "Move this claude somewhere else" means its pane — the process itself
+        // is not a thing tmux can move.
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| row.label() == "proc-101");
+        handle(&mut app, key(KeyCode::Char('m')));
+        assert_eq!(
+            app.marks,
+            vec![crate::tree::NodeId::Pane("local:1.2".into())]
+        );
+    }
+
+    #[test]
+    fn marking_a_window_marks_every_pane_in_it() {
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| {
+            matches!(&row.kind, Kind::Window { index: 2, .. })
+        });
+        handle(&mut app, key(KeyCode::Char('m')));
+        let targets: Vec<String> = app
+            .marked_panes()
+            .iter()
+            .map(|pane| pane.target.clone())
+            .collect();
+        assert_eq!(targets, ["local:2.1", "local:2.2"]);
+    }
+
+    #[test]
+    fn marking_is_a_toggle_and_capital_m_clears() {
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| matches!(&row.kind, Kind::Pane { .. }));
+        handle(&mut app, key(KeyCode::Char('m')));
+        handle(&mut app, key(KeyCode::Char('m')));
+        assert!(app.marks.is_empty());
+
+        handle(&mut app, key(KeyCode::Char('m')));
+        handle(&mut app, key(KeyCode::Char('M')));
+        assert!(app.marks.is_empty());
+    }
+
+    #[test]
+    fn a_session_row_cannot_be_marked() {
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| matches!(&row.kind, Kind::Session { .. }));
+        handle(&mut app, key(KeyCode::Char('m')));
+        assert!(app.marks.is_empty());
+        assert!(app.status.as_ref().is_some_and(|status| status.is_error));
+    }
+
+    #[test]
+    fn marks_survive_a_refresh() {
+        // A mark is held across scope changes and snapshots: the reader marks a
+        // pane, goes looking for where to put it, and comes back.
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| matches!(&row.kind, Kind::Pane { .. }));
+        handle(&mut app, key(KeyCode::Char('m')));
+        app.rebuild();
+        assert_eq!(app.marked_panes().len(), 1);
+    }
+
+    #[test]
+    fn xj_confirms_the_whole_plan_before_anything_moves() {
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| {
+            matches!(&row.kind, Kind::Window { index: 2, .. })
+        });
+        handle(&mut app, key(KeyCode::Char('m')));
+        // Destination: the first window.
+        select(&mut app, |row| {
+            matches!(&row.kind, Kind::Window { index: 1, .. })
+        });
+        handle(&mut app, key(KeyCode::Char('x')));
+        handle(&mut app, key(KeyCode::Char('j')));
+
+        let Some(Modal::Confirm { command, .. }) = &app.modal else {
+            panic!("a rearrange must be confirmed, not run on the keypress");
+        };
+        assert!(command.contains("join-pane -d -s %21 -t %11"), "{command}");
+        assert!(command.contains("join-pane -d -s %22 -t %11"), "{command}");
+        assert!(command.contains("will close"), "{command}");
+    }
+
+    #[test]
+    fn xj_without_marks_says_what_is_missing() {
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| matches!(&row.kind, Kind::Pane { .. }));
+        handle(&mut app, key(KeyCode::Char('x')));
+        handle(&mut app, key(KeyCode::Char('j')));
+        assert!(app.modal.is_none());
+        assert!(app.status.as_ref().is_some_and(|status| status.is_error));
+    }
+
+    #[test]
+    fn xb_falls_back_to_the_selected_pane_when_nothing_is_marked() {
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| row.label() == "proc-101");
+        handle(&mut app, key(KeyCode::Char('x')));
+        handle(&mut app, key(KeyCode::Char('b')));
+        let Some(Modal::Confirm { command, .. }) = &app.modal else {
+            panic!("expected a confirmation");
+        };
+        assert!(command.contains("break-pane -d -s %12"), "{command}");
+    }
+
+    #[test]
+    fn breaking_out_a_pane_that_is_alone_is_refused_rather_than_failing_in_tmux() {
+        let mut app = app_with_two_windows();
+        app.snapshot
+            .panes
+            .retain(|pane| pane.window_index != 2 || pane.pane_index != 2);
+        app.rebuild();
+        select(
+            &mut app,
+            |row| matches!(&row.kind, Kind::Pane { pane } if pane.target == "local:2.1"),
+        );
+        handle(&mut app, key(KeyCode::Char('x')));
+        handle(&mut app, key(KeyCode::Char('b')));
+        assert!(app.modal.is_none());
+        assert!(app.status.as_ref().is_some_and(|status| status.is_error));
+    }
+
+    #[test]
+    fn a_marked_row_can_be_cleared_with_esc_from_any_keyboard_layout() {
+        // `M` is unreachable under a Korean input source: shift+ㅡ is still ㅡ,
+        // so there is no uppercase for the physical-position map to produce.
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| matches!(&row.kind, Kind::Pane { .. }));
+        handle(&mut app, key(KeyCode::Char('m')));
+        handle(&mut app, key(KeyCode::Esc));
+        assert!(app.marks.is_empty());
+    }
+
+    #[test]
+    fn esc_clears_the_filter_before_it_clears_marks() {
+        let mut app = app_with_two_windows();
+        select(&mut app, |row| matches!(&row.kind, Kind::Pane { .. }));
+        handle(&mut app, key(KeyCode::Char('m')));
+        app.filter.query = "proc".into();
+        app.rebuild();
+        handle(&mut app, key(KeyCode::Esc));
+        assert!(!app.filter.is_active());
+        assert_eq!(app.marks.len(), 1, "one Esc must not drop both");
+    }
+
+    #[test]
+    fn a_flat_ordering_can_still_mark_the_pane_behind_a_process() {
+        // Flat sorts drop the pane rows, so the mark comes from the row's own
+        // recorded pane rather than from an ancestor row that is not there.
+        let mut app = app_with_two_windows();
+        app.sort = crate::tree::Sort::Cpu;
+        app.rebuild();
+        select(&mut app, |row| row.label() == "proc-103");
+        handle(&mut app, key(KeyCode::Char('m')));
+        assert_eq!(
+            app.marked_panes()
+                .iter()
+                .map(|pane| pane.target.clone())
+                .collect::<Vec<_>>(),
+            ["local:2.2"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -915,6 +1226,8 @@ mod capture_tests {
             window_active: true,
             session_attached: true,
             zoomed: false,
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
         }];
         let proc = Proc {
             key: ProcKey::host(100),
@@ -1001,6 +1314,8 @@ mod expand_tests {
             window_active: true,
             session_attached: true,
             zoomed: false,
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
         }];
         for (pid, ppid) in [(100u32, 1u32), (101, 100), (102, 101), (103, 102)] {
             let proc = Proc {

@@ -61,12 +61,42 @@ The tree is the spine, but the interesting relationships do not run along it:
   *within* the tree buries the top consumer under whichever session it happens to
   live in. Flat rows carry `@session:window.pane` so "what is heavy" still answers
   "and where".
+- **`m`** marks the selected pane or window, **`xj`** moves every marked pane
+  into the window you are now on, and **`xb`** breaks them out into a window of
+  their own. See [Rearranging](#rearranging).
 - **`/`** searches the whole tree, including collapsed subtrees, and matches
   command lines, cwds, listening ports and **pids**.
 
 A flat ordering shows each process's *own* cpu and memory, not its subtree's:
 ranking by own-cpu while displaying the rollup made a correctly sorted list read
 as unsorted.
+
+## Rearranging
+
+The tree is also a way to *move* what it shows. `m` marks the selected row — a
+pane, a window (which marks all of its panes), or a process (which marks the
+pane that owns it) — and the header keeps the count while you go looking for a
+destination. `M`, or `Esc`, clears the marks.
+
+| | |
+|---|---|
+| `xj` | move every marked pane into the window under the cursor |
+| `xb` | break the marked panes out into a new window of their own |
+
+Merging two windows is `m` on the source window, move to the target, `xj`: tmux
+closes a window that loses its last pane, which is what a merge is. Moving one
+pane somewhere else is the same two keystrokes without the marking, since `xb`
+falls back to the selection.
+
+Nothing runs before the confirmation shows the whole plan — every `join-pane`,
+the `select-layout tiled` that a multi-pane move ends with, and a note naming
+any window that will close as a result.
+
+**Every command addresses panes as `%id`, never as `session:window.pane`.** Pane
+indexes are positional: moving `2.1` renumbers `2.2` to `2.1`, so a plan built
+from the targets on screen would move the wrong pane on its second step. `%id`
+survives both the move and the break, which is also why the panes gathered into
+a new window can name their destination before it exists.
 
 ## Introspection
 
