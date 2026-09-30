@@ -211,8 +211,16 @@ pub struct Pane {
     pub window_index: u32,
     pub window_name: String,
     pub pane_index: u32,
-    /// `session:window.pane` — the tmux target string, and the pane's identity.
+    /// `session:window.pane` — the tmux target string, and how a reader names
+    /// the pane.
     pub target: String,
+    /// `%N` — tmux's own pane id. Unlike `target`, this survives a move: pane
+    /// indexes are positional, so moving one pane renumbers the rest and a
+    /// target captured a moment ago would then point at a different pane.
+    /// Every mutating command uses this.
+    pub pane_id: String,
+    /// `@N` — the id of the window holding the pane, stable for the same reason.
+    pub window_id: String,
     pub cwd: String,
     /// The pane's foreground command as tmux reports it.
     pub current_command: String,

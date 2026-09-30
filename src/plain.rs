@@ -268,6 +268,8 @@ mod tests {
             window_active: true,
             session_attached: true,
             zoomed: false,
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
         }];
         let proc = Proc {
             key: ProcKey::host(100),
